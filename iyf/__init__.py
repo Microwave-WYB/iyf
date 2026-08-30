@@ -180,11 +180,6 @@ def download(
         raise engine.IyfError("concurrent_fragments must be at least 1")
     videos = resolve_all(link_or_query, episode)
     output_path = Path(output) if output is not None else None
-    if len(videos) > 1 and output_path is not None and output_path.suffix:
-        raise engine.IyfError(
-            "-o must be a directory when downloading multiple episodes"
-        )
-
     renderer = ProgressRenderer(videos) if progress else None
     paths: list[Path] = []
     try:
@@ -195,11 +190,8 @@ def download(
                     / engine.sanitize_filename(video.show_name)
                     / video.filename
                 )
-            elif len(videos) > 1 or output_path.is_dir():
-                destination = output_path / video.filename
             else:
-                destination = output_path
-            destination.parent.mkdir(parents=True, exist_ok=True)
+                destination = output_path / video.filename
 
             engine.download(
                 video.stream_url,

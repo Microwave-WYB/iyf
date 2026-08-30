@@ -44,6 +44,8 @@ Output:
 
 Each item has `path: str`, the downloaded file path.
 
+The `-o` option always specifies an output directory. Filenames are generated automatically; do not pass a file path to `-o`.
+
 Episode selectors accepted by `-e`/`--episode`:
 
 - `all`: all episodes

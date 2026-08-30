@@ -148,8 +148,7 @@ def download(
     output: Path | None = typer.Option(
         None,
         "-o",
-        "--output",
-        help="输出文件或目录（默认：iyf_downloads/<名称>/<视频>.mp4）",
+        help="输出目录（默认：iyf_downloads/<名称>/）",
     ),
     episode: str | None = typer.Option(
         None,

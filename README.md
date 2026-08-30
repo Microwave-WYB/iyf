@@ -55,7 +55,7 @@ pip install iyf
 
 ```sh
 iyf download <link-or-query>
-iyf download <link-or-query> -o /path/to/video.mp4
+iyf download <link-or-query> -o /path/to/output-directory
 iyf d "show name" -e all
 iyf d "show name" -e "1-24"
 iyf d "show name" -e "1,3-5,23"
@@ -74,12 +74,12 @@ iyf d "show name" -e all --json
 
 Search JSON is a list of `{ "show_id": ..., "title": ... }` objects; download JSON is a list of `{ "path": ... }` objects. Rich progress and yt-dlp logs are disabled in JSON mode.
 
-When `-o` is omitted, the file is saved as
-`iyf_downloads/<resolved series-or-movie name>/<resolved video name>.mp4`.
+When `-o` is omitted, files are saved under
+`iyf_downloads/<resolved series-or-movie name>/`. When provided, `-o` is always
+treated as an output directory; iyf generates each filename automatically.
 
 `-e`/`--episode` accepts `all`, an inclusive range such as `1-24`, or
-comma-separated values and ranges such as `1,3-5,23`. For multiple episodes,
-`-o` is treated as an output directory.
+comma-separated values and ranges such as `1,3-5,23`.
 yt-dlp logs are hidden by default; use `-V`/`--verbose` to show them.
 `-N`/`--concurrent-fragments` defaults to 8 and controls yt-dlp HLS fragment concurrency.
 
