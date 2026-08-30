@@ -4,6 +4,13 @@
 ```sh
 uv tool install https://github.com/Microwave-WYB/iyf
 ```
+## Let your LLM agent explain everything to you:
+
+Tell your agent to run this:
+```
+iyf --skill
+```
+
 
 ## Library
 ```
