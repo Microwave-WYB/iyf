@@ -22,6 +22,15 @@ uv add git+https://github.com/Microwave-WYB/iyf.git
 pip install git+https://github.com/Microwave-WYB/iyf.git
 ```
 
+```python
+import iyf
+
+matches = iyf.query("生活大爆炸")
+video = iyf.resolve("https://www.iyf.lv/iyfplay/49615-1-2/")
+print(video.filename)
+paths = iyf.download(video.link, episode="1-3")
+```
+
 <!--Minimal Python library and CLI for downloading videos from [iyf.tv](https://www.iyf.tv)
 and [iyf.lv](https://www.iyf.lv). It resolves a copied page URL or show-name
 query, finds the embedded HLS stream, and downloads it with yt-dlp.
