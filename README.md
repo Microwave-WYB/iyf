@@ -2,7 +2,7 @@
 
 ## CLI
 ```sh
-uv tool install https://github.com/Microwave-WYB/iyf
+uv tool install git+https://github.com/Microwave-WYB/iyf
 iyf
 ```
 ## Let your LLM agent explain everything to you:
