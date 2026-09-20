@@ -1,6 +1,6 @@
 [project]
 name = "iyf"
-version = "0.2.0"
+version = "0.3.0"
 description = "Minimal library and CLI for downloading iyf.tv and iyf.lv videos"
 readme = "README.md"
 requires-python = ">=3.14"

@@ -77,9 +77,51 @@ Search JSON is a list of `{ "show_id": ..., "title": ... }` objects; download JS
 
 Name-query quality selection is bounded to the first 3 search results and first 6 lines per result. Within that bounded set it selects the highest declared-quality valid HLS line. Each inspected line makes at most 5 playlist requests (1 root plus up to 4 expansions), so the 18-line cap allows at most 90 playlist requests. If a master has more variants than the remaining budget, only the highest-ranked remaining variants are tried. The interactive candidate table still enumerates all search results (existing behavior, outside this quality-selection cap). Identical quality tags use the lower line number, and explicit iyfplay/iyftv URLs and numeric IDs remain pinned instead of being upgraded. Child playlists use the fixed User-Agent/Referer; a production CDN requiring extra headers, cookies, or signed child URIs may make that line appear invalid. This is metadata selection only; it does not sample media with ffmpeg.
 
-When `-o` is omitted, files are saved under
-`iyf_downloads/<resolved series-or-movie name>/`. When provided, `-o` is always
-treated as an output directory; iyf generates each filename automatically.
+Files are written in the media-library layout that Jellyfin, Emby, Plex and
+Kodi all read (a directory convention, not an integration), and nothing else
+about any media server is assumed:
+
+```
+iyf_downloads/生活大爆炸/Season 07/生活大爆炸 S07E01.mp4
+```
+
+`-o` replaces the `iyf_downloads/` root; the layout below it stays the same, so
+`-o /mnt/storage/media` gives `/mnt/storage/media/生活大爆炸/Season 07/...`. A
+single-video entry (a film or documentary) is named like a movie instead of an
+episode: `<root>/<title>/<title>.mp4`.
+
+`--strm` writes those files as `.strm` pointers instead of downloading media:
+
+```sh
+iyf d "权力的游戏 第一季" -e all --strm -o /mnt/storage/media
+```
+
+Each `.strm` file holds only the resolved HLS URL, which is what a media server
+reads, and the directory holding the files (the season folder for a series)
+gets an `.iyf.json` sidecar recording the show and line it came from. Each
+season keeps its own sidecar, since the seasons of one title share a directory.
+`iyf refresh <library root or title directory>`
+re-resolves those files and rewrites the ones whose URL changed, using the
+sidecar so it never has to search by name again. `--check-only` reports without
+writing anything, and both forms exit non-zero when a file is broken (its show,
+line, episode or playlist is gone), which makes them usable from cron; a file
+that merely needed updating is not an error. Directories without a readable
+sidecar are left alone, and so are `.strm` files whose names do not match the
+sidecar's title.
+
+Known limitations of that layout and of refresh:
+
+- An entry that exposes a single episode in total is laid out as a film, because
+  iyf has no reliable media-type field to tell a one-episode series from a movie.
+- A directory holds one source at a time. Writing files resolved from another
+  show or line into a directory that already has a sidecar is refused instead of
+  mixed; delete the directory or its `.iyf.json` to switch sources.
+- Refresh only touches `.strm` files whose names match the sidecar's title
+  (`<title>.strm` or `<title> SxxExx.strm`); anything else in the folder, and any
+  directory without a readable sidecar, is left alone.
+- Quality is chosen from declared playlist metadata only. Ties are broken by the
+  lower line number, so a preference such as native film cadence cannot be
+  honoured when the tags do not say.
 
 `-e`/`--episode` accepts `all`, an inclusive range such as `1-24`, or
 comma-separated values and ranges such as `1,3-5,23`.
