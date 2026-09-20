@@ -258,7 +258,14 @@ def resolve_all(link_or_query: str, episode: str | None = None) -> list[Video]:
     show_name = engine.RE_SEASON_TOKEN.sub("", series.title).strip() or series.title
     # A single-video entry (a film or documentary) is named like a movie, not
     # like an episode, so a media server does not file it under season 1.
-    is_series = sum(len(item.episodes) for item in series.lines) > 1
+    # Counting unique episode numbers keeps several lines that all expose the
+    # same single episode from looking like a series.
+    unique_episodes = {
+        int(episode.number)
+        for show_line in series.lines
+        for episode in show_line.episodes
+    }
+    is_series = len(unique_episodes) > 1
     videos: list[Video] = []
     for selected_episode in _select_episodes(
         line.episodes, normalized.episode, episode
@@ -348,7 +355,7 @@ def library_path(root: str | Path, video: Video, filename: str) -> Path:
 
 
 def series_directory(root: str | Path, video: Video) -> Path:
-    """Return the directory that holds one title's files and sidecar."""
+    """Return the directory that holds one title: its seasons and files."""
     return Path(root) / engine.sanitize_filename(video.show_name)
 
 
@@ -360,17 +367,52 @@ def _write_sidecar(directory: Path, video: Video) -> None:
     )
 
 
-def _read_sidecar(directory: Path) -> tuple[str, int] | None:
+def _read_sidecar(directory: Path) -> tuple[str, int, str] | None:
+    """Return the ``(show_id, line, title)`` a directory's files came from."""
     try:
         payload = json.loads((directory / SIDECAR_NAME).read_text(encoding="utf-8"))
     except OSError, ValueError:
         return None
     if not isinstance(payload, dict):
         return None
-    show_id, line = payload.get("show_id"), payload.get("line")
+    show_id, line, title = (
+        payload.get("show_id"),
+        payload.get("line"),
+        payload.get("title"),
+    )
     if not isinstance(show_id, str) or not isinstance(line, int):
         return None
-    return show_id, line
+    return show_id, line, title if isinstance(title, str) else ""
+
+
+def _reject_mixed_sources(destinations: list[tuple[Path, Video]]) -> None:
+    """Refuse to add files from another source to a directory that has one.
+
+    Two iyf entries can carry the same title and season (49684 and 95676 are
+    both 权力的游戏 第一季), so writing both into one folder would overwrite
+    files and then let refresh re-resolve every file from whichever entry was
+    written last.
+    """
+    for destination, video in destinations:
+        existing = _read_sidecar(destination.parent)
+        if existing is None:
+            continue
+        show_id, line, _title = existing
+        if (show_id, line) != (video.show_id, video.line):
+            raise engine.IyfError(
+                f"{destination.parent} already holds streams from show {show_id} "
+                f"line {line}; refusing to mix it with show {video.show_id} "
+                f"line {video.line}. Delete that directory or its "
+                f"{SIDECAR_NAME} to switch sources."
+            )
+
+
+def _belongs_to_title(stream_file: Path, title: str) -> bool:
+    """Return whether a ``.strm`` file looks like one this sidecar describes."""
+    if not title:
+        return True
+    safe = engine.sanitize_filename(title)
+    return stream_file.stem == safe or stream_file.stem.startswith(f"{safe} S")
 
 
 def write_streams(
@@ -381,17 +423,28 @@ def write_streams(
     """Write ``.strm`` pointer files instead of downloading media.
 
     Each file holds only the resolved HLS URL, which is what media servers
-    read. The title directory also gets an :data:`SIDECAR_NAME` file recording
-    the show and line it was resolved from, so :func:`refresh_streams` can
-    re-resolve later without searching by name again.
+    read. The directory holding the files - the season folder for a series, the
+    title folder for a single video - also gets an :data:`SIDECAR_NAME` file
+    recording the show and line they were resolved from, so
+    :func:`refresh_streams` can re-resolve later without searching by name
+    again. Writing files from a different show or line into a directory that
+    already holds one is refused instead of silently mixed.
     """
     videos = resolve_all(link_or_query, episode)
     root = Path(output) if output is not None else Path("iyf_downloads")
+    planned = [
+        (library_path(root, video, video.stream_filename), video) for video in videos
+    ]
+    _reject_mixed_sources(planned)
     paths: list[Path] = []
-    for video in videos:
-        destination = library_path(root, video, video.stream_filename)
+    for destination, video in planned:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(f"{video.stream_url}\n", encoding="utf-8")
+        # The sidecar sits next to the files it describes: a season folder for
+        # a series, the title folder for a single video. One title can hold
+        # several seasons, so a single sidecar per title would let a later
+        # season overwrite the show and line the other seasons refresh from.
+        _write_sidecar(destination.parent, video)
         # The sidecar sits next to the files it describes: a season folder for
         # a series, the title folder for a single video. One title can hold
         # several seasons, so a single sidecar per title would let a later
@@ -423,10 +476,11 @@ def _candidate_directories(target: Path) -> list[Path]:
     return found
 
 
-def _broken(directory: Path, detail: str) -> list[StreamStatus]:
+def _broken(directory: Path, detail: str, title: str = "") -> list[StreamStatus]:
     return [
         StreamStatus(item, "broken", detail)
         for item in sorted(directory.glob("*.strm"))
+        if _belongs_to_title(item, title)
     ]
 
 
@@ -443,18 +497,22 @@ def refresh_streams(path: str | Path, check_only: bool = False) -> list[StreamSt
         sidecar = _read_sidecar(directory)
         if sidecar is None:
             continue
-        show_id, line_number = sidecar
+        show_id, line_number, title = sidecar
         try:
             series = engine.get_show(show_id)
         except engine.IyfError as error:
-            statuses.extend(_broken(directory, f"show {show_id}: {error}"))
+            statuses.extend(_broken(directory, f"show {show_id}: {error}", title))
             continue
         line = series.line(line_number)
         if line is None:
-            statuses.extend(_broken(directory, f"line {line_number} is gone"))
+            statuses.extend(_broken(directory, f"line {line_number} is gone", title))
             continue
         by_number = {int(item.number): item for item in line.episodes}
         for stream_file in sorted(directory.glob("*.strm")):
+            if not _belongs_to_title(stream_file, title):
+                # Another tool's pointer file: a sidecar claims this title's
+                # files, not everything that happens to sit beside them.
+                continue
             match = _EPISODE_RE.search(stream_file.stem)
             episode = int(match.group(1)) if match else min(by_number, default=None)
             if episode is None or episode not in by_number:

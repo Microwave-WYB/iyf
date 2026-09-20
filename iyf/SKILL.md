@@ -38,13 +38,14 @@ Output:
 
 ```json
 [
-  {"path": "iyf_downloads/生活大爆炸/生活大爆炸 S04E02.mp4"}
+  {"path": "iyf_downloads/生活大爆炸/Season 04/生活大爆炸 S04E02.mp4"}
 ]
 ```
 
 Each item has `path: str`, the written file path.
 
-Files use the media-library layout that Jellyfin, Emby, Plex and Kodi all read:
+Files use the media-library layout that Jellyfin, Emby, Plex and Kodi all read
+(a directory convention, not an integration):
 `<root>/<title>/Season NN/<title> SxxExx.mp4`, or `<root>/<title>/<title>.mp4`
 for a single-video entry (a film or documentary). `-o` replaces the
 `iyf_downloads/` root and the layout below it stays the same, so
@@ -70,8 +71,9 @@ iyf refresh /mnt/storage/media --check-only --json
 ```
 
 Re-resolves the `.strm` files under a library root or a single title directory,
-rewriting the ones whose URL changed. `--check-only` reports without writing and
-exits non-zero when a file is stale or broken.
+rewriting the ones whose URL changed. `--check-only` reports without writing
+anything. Both forms exit non-zero only when a file is broken (show, line,
+episode or playlist gone); a file that merely needed updating is not an error.
 
 Output:
 

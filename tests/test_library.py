@@ -102,6 +102,44 @@ class WriteStreamsTest(unittest.TestCase):
                 sidecar, {"show_id": "95676", "line": 2, "title": "权力的游戏"}
             )
 
+    def test_writing_another_source_into_the_same_season_is_refused(self) -> None:
+        # Two iyf entries can carry the same title and season (49684 and 95676
+        # are both 权力的游戏 第一季), so the second must not silently take over
+        # the folder the first one filled.
+        other = Video(
+            link="https://www.iyf.lv/iyftv/49684/",
+            show_id="49684",
+            line=1,
+            show_name="权力的游戏",
+            season=1,
+            episode="1",
+            episode_title="第1集",
+            media_class="欧美",
+            stream_url="https://cdn.example/other/index.m3u8",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                iyf, "resolve_all", return_value=[series_video("1")]
+            ):
+                write_streams("权力的游戏 第一季", directory, "1")
+            season = Path(directory) / "权力的游戏" / "Season 01"
+            with (
+                mock.patch.object(iyf, "resolve_all", return_value=[other]),
+                self.assertRaises(engine.IyfError),
+            ):
+                write_streams("权力的游戏第一季", directory, "1")
+
+            self.assertEqual(
+                (season / "权力的游戏 S01E01.strm").read_text(encoding="utf-8"),
+                "https://cdn.example/old/index.m3u8\n",
+            )
+            self.assertEqual(
+                json.loads((season / SIDECAR_NAME).read_text(encoding="utf-8"))[
+                    "show_id"
+                ],
+                "95676",
+            )
+
 
 class _StubEngine:
     """Stand in for the engine calls refresh_streams makes."""
@@ -211,7 +249,13 @@ class RefreshStreamsTest(unittest.TestCase):
             movie = series / "权力的游戏：最后的守夜人.strm"
             movie.write_text("https://cdn.example/old/index.m3u8\n", encoding="utf-8")
             (series / SIDECAR_NAME).write_text(
-                json.dumps({"show_id": "101575", "line": 1, "title": "守夜人"}),
+                json.dumps(
+                    {
+                        "show_id": "101575",
+                        "line": 1,
+                        "title": "权力的游戏：最后的守夜人",
+                    }
+                ),
                 encoding="utf-8",
             )
             with _StubEngine("https://cdn.example/new/index.m3u8"):
@@ -273,6 +317,53 @@ class RefreshStreamsTest(unittest.TestCase):
                     / f"权力的游戏 S{season}E01.strm"
                 ).read_text(encoding="utf-8")
                 self.assertEqual(written, f"https://cdn.example/{show_id}/S2E1.m3u8\n")
+
+    def test_other_tools_strm_files_are_left_alone(self) -> None:
+        # A sidecar claims this title's files, not everything that happens to
+        # sit beside them.
+        with tempfile.TemporaryDirectory() as directory:
+            _, episode = self._library(directory)
+            stray = episode.parent / "other-tool.strm"
+            stray.write_text("https://other.example/x.m3u8\n", encoding="utf-8")
+            with _StubEngine("https://cdn.example/new/index.m3u8"):
+                statuses = refresh_streams(directory)
+            self.assertEqual(
+                [item.path.name for item in statuses], ["权力的游戏 S01E02.strm"]
+            )
+            self.assertEqual(
+                stray.read_text(encoding="utf-8"), "https://other.example/x.m3u8\n"
+            )
+
+
+class SeriesDetectionTest(unittest.TestCase):
+    @staticmethod
+    def _resolve(series: engine.Series) -> list[iyf.Video]:
+        with (
+            mock.patch.object(
+                iyf, "_source", return_value=engine.Source(series.show_id, 2)
+            ),
+            mock.patch.object(engine, "get_show", return_value=series),
+            mock.patch.object(
+                engine, "get_play_info", return_value=engine.PlayInfo("u", None)
+            ),
+        ):
+            return iyf.resolve_all(series.show_id, "1")
+
+    def test_two_lines_exposing_one_episode_is_not_a_series(self) -> None:
+        episodes = [engine.Episode("1", "正片")]
+        series = engine.Series(
+            "101575", "某纪录片", [engine.Line(1, episodes), engine.Line(2, episodes)]
+        )
+        video = self._resolve(series)[0]
+        self.assertFalse(video.is_series)
+        self.assertEqual(video.filename, "某纪录片.mp4")
+
+    def test_multiple_episodes_is_a_series(self) -> None:
+        episodes = [engine.Episode("1", "第1集"), engine.Episode("2", "第2集")]
+        series = engine.Series("95676", "权力的游戏 第一季", [engine.Line(2, episodes)])
+        video = self._resolve(series)[0]
+        self.assertTrue(video.is_series)
+        self.assertEqual(video.filename, "权力的游戏 S01E01.mp4")
 
 
 if __name__ == "__main__":
