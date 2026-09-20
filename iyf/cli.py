@@ -87,22 +87,23 @@ def _download(
             if parsed.line is None:
                 series = engine.get_show(parsed.show_id)
                 choice = _select_quality_line_for(series, parsed.episode, episode)
-                if choice is not None:
-                    line, inspection = choice
-                    # Keep an episode that came with the url, or the first one
-                    # the selector asks for: writing "1" would misreport what is
-                    # about to be exported.
-                    episode_number = parsed.episode
-                    if episode_number is None:
-                        episode_number = _first_selected_episode(episode) or 1
-                    resolved_source = (
-                        f"https://www.iyf.lv/iyfplay/"
-                        f"{parsed.show_id}-{line.number}-{episode_number}/"
-                    )
-                    selection_message = (
-                        f"已选择：{series.title} 线路 {line.number}（"
-                        f"{engine.playlist_quality_label(inspection)}）"
-                    )
+                if choice is None:
+                    raise IyfError(f"no playable line found for show {parsed.show_id}")
+                line, inspection = choice
+                # Keep an episode that came with the url, or the first one
+                # the selector asks for: writing "1" would misreport what is
+                # about to be exported.
+                episode_number = parsed.episode
+                if episode_number is None:
+                    episode_number = _first_selected_episode(episode) or 1
+                resolved_source = (
+                    f"https://www.iyf.lv/iyfplay/"
+                    f"{parsed.show_id}-{line.number}-{episode_number}/"
+                )
+                selection_message = (
+                    f"已选择：{series.title} 线路 {line.number}（"
+                    f"{engine.playlist_quality_label(inspection)}）"
+                )
         if not json_output:
             console.print(
                 selection_message or "正在请求 iyf API 并解析视频信息，请稍候…",

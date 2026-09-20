@@ -153,19 +153,18 @@ def test_a_pinned_line_is_left_alone(monkeypatch, tmp_path) -> None:
     assert seen["src"] == "https://www.iyf.lv/iyfplay/49676-1-1/"
 
 
-def test_no_playable_line_leaves_the_source_alone(monkeypatch, tmp_path) -> None:
-    source = "https://www.iyf.lv/iyftv/49676/"
-
-    resolved = _run(
-        monkeypatch,
-        tmp_path,
-        source,
-        engine.Source("49676"),
-        _series(_one_episode_line(1)),
-        None,
+@pytest.mark.parametrize("source", ["https://www.iyf.lv/iyftv/49676/", "49676"])
+def test_no_playable_line_does_not_use_default_line(
+    monkeypatch, tmp_path, source
+) -> None:
+    monkeypatch.setattr(cli, "_source", lambda text: engine.Source("49676"))
+    monkeypatch.setattr(
+        cli.engine, "get_show", lambda show_id: _series(_one_episode_line(1))
     )
+    monkeypatch.setattr(cli, "_select_quality_line_for", lambda *args: None)
 
-    assert resolved == source
+    with pytest.raises(typer.Exit):
+        cli._download(source, tmp_path, None, False, 8, False, strm=True)
 
 
 def test_a_foreign_link_still_fails(monkeypatch, tmp_path) -> None:
