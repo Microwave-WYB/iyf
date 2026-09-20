@@ -227,3 +227,33 @@ statuses = refresh_streams("/mnt/storage/media", check_only=True)
 `resolve()` returns one `Video` and raises if multiple episodes are selected. Use `resolve_all()` for multiple episodes. Files land in `iyf_downloads/<title>/Season NN/` (or `<title>/` for a single-video entry) unless `output` replaces that root; `library_path()` and `series_directory()` expose the same layout to callers that need to compute paths.
 
 Name-query quality selection is bounded to the first 3 search results and first 6 lines per result. Within that bounded set it chooses the highest declared-quality valid HLS line. Each inspected line makes at most 5 playlist requests (1 root plus up to 4 expansions), so the 18-line cap allows at most 90 playlist requests. If a master has more variants than the remaining budget, only the highest-ranked remaining variants are tried. The interactive candidate table still enumerates all search results (existing behavior, outside this quality-selection cap). Equal tags are tied by lower line number; tags do not reveal undeclared frame-rate differences. Explicit iyfplay/iyftv URLs and numeric IDs remain pinned. Child playlists use the fixed User-Agent/Referer; a production CDN requiring extra headers, cookies, or signed child URIs may make that line appear invalid. No media quality probing is performed.
+
+## Watching without downloading (Jellyfin)
+
+[Jellyfin](https://jellyfin.org/downloads/) is a free media server with clients
+for Android, iOS and most TV platforms; if a TV cannot install it, casting from
+a phone usually works. Point it at a library folder and it streams to those
+clients, so nothing has to be downloaded first.
+
+Per episode, write the resolved stream URL as a one-line `.strm` file:
+
+```
+<library>/<Show>/Season NN/<Show> SxxEyy.strm
+```
+
+Then refresh the library; Jellyfin indexes it as a normal episode.
+
+- Keep a whole season on one line: episode numbering and quality differ between
+  lines, and mixing them shows up as gaps or repeats.
+- Skip episodes that already exist as real media files, or they appear as a
+  second version of the same episode.
+- Use the show's English title for the folder name so metadata matching is
+  reliable; viewers still see the localized title.
+- Clients play straight from the CDN, so the Jellyfin host neither proxies nor
+  transcodes and stays idle. The counterpart: there is no local copy, and the
+  client itself needs internet access to that CDN.
+- A `.strm` holds a resolved stream URL, so if the CDN rotates paths every file
+  goes stale at once. Keep `show_id`/`line`/`episode` alongside each file so it
+  can be re-resolved without searching again.
+- Jellyfin clients and ffmpeg-based players handle the AES-128 HLS; desktop
+  VLC does not.
