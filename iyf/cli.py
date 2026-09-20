@@ -42,9 +42,10 @@ def _download(
 ) -> None:
     resolved_source = source
     try:
+        # Title queries pick a line by quality; links and bare ids do the same
+        # further down, once there is a url to pin the chosen line into.
         if (
-            not json_output
-            and not source.lower().startswith(("http://", "https://"))
+            not source.lower().startswith(("http://", "https://"))
             and not source.strip().isdigit()
         ):
             selection = _pick_query_source(source)
@@ -62,7 +63,9 @@ def _download(
         # the export silently falls back to DEFAULT_LINE, which may be a line
         # whose episodes are all gone. Pick a line the same way a title query
         # does, unless the caller already pinned one in the url.
-        if not json_output and (
+        # Selection is not tied to the output format: --json changes what is
+        # printed, not which stream gets exported.
+        if (
             resolved_source.lower().startswith(("http://", "https://"))
             or resolved_source.strip().isdigit()
         ):
@@ -72,8 +75,12 @@ def _download(
                 choice = _select_quality_line(series)
                 if choice is not None:
                     line, inspection = choice
+                    # Keep an episode that came with the url: writing "1" here
+                    # would silently export a different episode than asked for.
+                    episode_number = parsed.episode if parsed.episode is not None else 1
                     resolved_source = (
-                        f"https://www.iyf.lv/iyfplay/{parsed.show_id}-{line.number}-1/"
+                        f"https://www.iyf.lv/iyfplay/"
+                        f"{parsed.show_id}-{line.number}-{episode_number}/"
                     )
                     selection_message = (
                         f"已选择：{series.title} 线路 {line.number}（"
