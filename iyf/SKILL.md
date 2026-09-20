@@ -75,6 +75,13 @@ rewriting the ones whose URL changed. `--check-only` reports without writing
 anything. Both forms exit non-zero only when a file is broken (show, line,
 episode or playlist gone); a file that merely needed updating is not an error.
 
+Known limitations: an entry with a single episode in total is laid out as a film
+(there is no reliable media-type field); a directory holds one source at a time,
+so writing files from another show or line into it is refused rather than mixed
+(delete the directory or its `.iyf.json` to switch); and refresh only touches
+`.strm` files whose names match the sidecar's title, leaving everything else,
+including directories without a readable sidecar, alone.
+
 Output:
 
 ```json

@@ -109,6 +109,20 @@ that merely needed updating is not an error. Directories without a readable
 sidecar are left alone, and so are `.strm` files whose names do not match the
 sidecar's title.
 
+Known limitations of that layout and of refresh:
+
+- An entry that exposes a single episode in total is laid out as a film, because
+  iyf has no reliable media-type field to tell a one-episode series from a movie.
+- A directory holds one source at a time. Writing files resolved from another
+  show or line into a directory that already has a sidecar is refused instead of
+  mixed; delete the directory or its `.iyf.json` to switch sources.
+- Refresh only touches `.strm` files whose names match the sidecar's title
+  (`<title>.strm` or `<title> SxxExx.strm`); anything else in the folder, and any
+  directory without a readable sidecar, is left alone.
+- Quality is chosen from declared playlist metadata only. Ties are broken by the
+  lower line number, so a preference such as native film cadence cannot be
+  honoured when the tags do not say.
+
 `-e`/`--episode` accepts `all`, an inclusive range such as `1-24`, or
 comma-separated values and ranges such as `1,3-5,23`.
 yt-dlp logs are hidden by default; use `-V`/`--verbose` to show them.

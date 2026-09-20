@@ -334,6 +334,31 @@ class RefreshStreamsTest(unittest.TestCase):
                 stray.read_text(encoding="utf-8"), "https://other.example/x.m3u8\n"
             )
 
+    def test_lookalike_files_are_not_treated_as_this_title(self) -> None:
+        # "<title> Sideload.strm" is not "<title> SxxExx.strm".
+        with tempfile.TemporaryDirectory() as directory:
+            _, episode = self._library(directory)
+            lookalike = episode.parent / "权力的游戏 Sideload.strm"
+            lookalike.write_text("https://other.example/x.m3u8\n", encoding="utf-8")
+            with _StubEngine("https://cdn.example/new/index.m3u8"):
+                statuses = refresh_streams(directory)
+            self.assertEqual(
+                [item.path.name for item in statuses], ["权力的游戏 S01E02.strm"]
+            )
+            self.assertEqual(
+                lookalike.read_text(encoding="utf-8"), "https://other.example/x.m3u8\n"
+            )
+
+    def test_sidecar_without_a_title_is_ignored(self) -> None:
+        # Without a title the directory cannot be filtered safely, so it is not
+        # treated as iyf's to manage.
+        with tempfile.TemporaryDirectory() as directory:
+            series, _ = self._library(directory)
+            (series / "Season 01" / SIDECAR_NAME).write_text(
+                json.dumps({"show_id": "95676", "line": 2}), encoding="utf-8"
+            )
+            self.assertEqual(refresh_streams(directory), [])
+
 
 class SeriesDetectionTest(unittest.TestCase):
     @staticmethod

@@ -382,7 +382,11 @@ def _read_sidecar(directory: Path) -> tuple[str, int, str] | None:
     )
     if not isinstance(show_id, str) or not isinstance(line, int):
         return None
-    return show_id, line, title if isinstance(title, str) else ""
+    if not isinstance(title, str) or not title.strip():
+        # A title is what identifies the files this sidecar describes; without
+        # one its directory cannot be filtered safely.
+        return None
+    return show_id, line, title
 
 
 def _reject_mixed_sources(destinations: list[tuple[Path, Video]]) -> None:
@@ -408,11 +412,14 @@ def _reject_mixed_sources(destinations: list[tuple[Path, Video]]) -> None:
 
 
 def _belongs_to_title(stream_file: Path, title: str) -> bool:
-    """Return whether a ``.strm`` file looks like one this sidecar describes."""
-    if not title:
-        return True
+    """Return whether a ``.strm`` file is one this sidecar describes.
+
+    Only the exact single-video name or the ``<title> SxxExx`` shape counts, so
+    an unrelated ``<title> Sideload.strm`` beside them is left alone.
+    """
     safe = engine.sanitize_filename(title)
-    return stream_file.stem == safe or stream_file.stem.startswith(f"{safe} S")
+    stem = stream_file.stem
+    return stem == safe or bool(re.fullmatch(rf"{re.escape(safe)} S\d+E\d+", stem))
 
 
 def write_streams(
@@ -440,11 +447,6 @@ def write_streams(
     for destination, video in planned:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(f"{video.stream_url}\n", encoding="utf-8")
-        # The sidecar sits next to the files it describes: a season folder for
-        # a series, the title folder for a single video. One title can hold
-        # several seasons, so a single sidecar per title would let a later
-        # season overwrite the show and line the other seasons refresh from.
-        _write_sidecar(destination.parent, video)
         # The sidecar sits next to the files it describes: a season folder for
         # a series, the title folder for a single video. One title can hold
         # several seasons, so a single sidecar per title would let a later
@@ -490,7 +492,8 @@ def refresh_streams(path: str | Path, check_only: bool = False) -> list[StreamSt
     Point it at a library root or a single title directory. Files are matched
     to episodes by the ``SxxExx`` part of their name; a file without one is
     treated as a single-video entry. With ``check_only`` nothing is rewritten,
-    which makes a stale or broken library a non-zero exit status for cron.
+    and only a broken file makes the exit status non-zero: one that merely
+    needed updating is not an error.
     """
     statuses: list[StreamStatus] = []
     for directory in _candidate_directories(Path(path)):
