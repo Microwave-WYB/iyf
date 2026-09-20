@@ -3,14 +3,26 @@
 import html
 import json
 import re
+import threading
+import time
+import urllib.parse
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from glob import glob
 from pathlib import Path
 from typing import TypedDict
 
 import httpx
 import yt_dlp
-from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 HOST = "https://www.iyf.lv"
 DEFAULT_LINE = 1
@@ -305,23 +317,210 @@ def sanitize_filename(name: str) -> str:
     return name.strip().strip(".") or "video"
 
 
+@dataclass
+class ProgressSample:
+    """One progress observation for a single download."""
+
+    downloaded: int | None = None
+    total: int | None = None
+    speed: float | None = None
+    finished: bool = False
+
+
+_SIZE_PROBE_WORKERS = 16
+_MAX_PROBE_SEGMENTS = 400
+
+
+def _playlist_segments(text: str, base_url: str) -> tuple[list[str], list[float]]:
+    """Return segment URLs and their durations from a media playlist."""
+    urls: list[str] = []
+    durations: list[float] = []
+    pending = 0.0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = float(line[len("#EXTINF:") :].split(",")[0])
+            except ValueError:
+                pending = 0.0
+        elif not line.startswith("#"):
+            urls.append(urllib.parse.urljoin(base_url, line))
+            durations.append(pending)
+            pending = 0.0
+    return urls, durations
+
+
+def _best_variant(media_url: str, text: str) -> str | None:
+    """Return the highest-bandwidth variant URL declared by a master playlist."""
+    best_url: str | None = None
+    best_bandwidth = -1
+    bandwidth = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            match = re.search(r"BANDWIDTH=(\d+)", line)
+            bandwidth = int(match.group(1)) if match else 0
+        elif line and not line.startswith("#"):
+            if bandwidth > best_bandwidth:
+                best_bandwidth = bandwidth
+                best_url = urllib.parse.urljoin(media_url, line)
+            bandwidth = 0
+    return best_url
+
+
+def probe_total_bytes(media_url: str, deadline: float = 4.0) -> int | None:
+    """Measure the payload size of an HLS VOD stream in bytes.
+
+    yt-dlp has no size for HLS up front, and its ``total_bytes_estimate`` is
+    extrapolated from finished fragments: on a measured 310.6 MB episode it
+    started at 789 MB and only converged at the very end. Sampling segment
+    sizes is not good enough either, because segment sizes here run from
+    100 KB to 11 MB over 0.8-20 s of media, so an 8-to-64 segment sample
+    landed 2.5-17% off. Asking every segment for its ``Content-Length``
+    downloaded payload to within a kilobyte. Returns ``None`` instead of
+    raising whenever the playlist or the headers are unusable, and otherwise
+    answers from whatever arrived within ``deadline`` seconds (scaled by
+    media time), so a slow CDN cannot stall the download it measures.
+    """
+    try:
+        text = _http_get(media_url)
+    except IyfError:
+        return None
+    if "#EXT-X-STREAM-INF" in text:
+        variant = _best_variant(media_url, text)
+        if variant is None:
+            return None
+        try:
+            text = _http_get(variant)
+        except IyfError:
+            return None
+        media_url = variant
+    if "#EXT-X-ENDLIST" not in text:
+        # A live or event playlist keeps growing, so its current segment list
+        # is not this download's total.
+        return None
+    urls, durations = _playlist_segments(text, media_url)
+    total_duration = sum(durations)
+    if len(urls) < 2 or total_duration <= 0:
+        return None
+
+    if len(urls) > _MAX_PROBE_SEGMENTS:
+        # Very long playlists: sample evenly and scale by media time instead
+        # of issuing thousands of requests for one progress bar.
+        step = len(urls) // _MAX_PROBE_SEGMENTS + 1
+        picks = list(range(0, len(urls), step))
+    else:
+        picks = list(range(len(urls)))
+
+    def measure(index: int) -> tuple[int, float]:
+        try:
+            response = httpx.head(
+                urls[index],
+                headers={"User-Agent": USER_AGENT, "Referer": REFERER},
+                timeout=5.0,
+                follow_redirects=True,
+            )
+            return max(int(response.headers.get("content-length", 0)), 0), durations[
+                index
+            ]
+        except httpx.HTTPError, ValueError:
+            return 0, durations[index]
+
+    pool = ThreadPoolExecutor(max_workers=_SIZE_PROBE_WORKERS)
+    try:
+        futures = [pool.submit(measure, index) for index in picks]
+        done, pending = wait(futures, timeout=deadline)
+        for future in pending:
+            future.cancel()
+        measured = [future.result() for future in done if future.exception() is None]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    usable = [
+        (size, duration) for size, duration in measured if size > 0 and duration > 0
+    ]
+    if len(usable) < 2:
+        return None
+    covered = sum(duration for _, duration in usable)
+    measured_bytes = sum(size for size, _ in usable)
+    if len(picks) == len(urls) and len(usable) == len(urls):
+        return measured_bytes
+    return int(measured_bytes / covered * total_duration)
+
+
+def _part_bytes(out_path: str) -> int:
+    """Return the bytes written for ``out_path``, in-flight fragments included."""
+    total = 0
+    for path in (f"{out_path}.part", *glob(f"{out_path}.part-*")):
+        try:
+            total += Path(path).stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _watch_part_file(
+    out_path: str,
+    total: int | None,
+    emit: Callable[[ProgressSample], None],
+    hooked: threading.Event,
+    stop: threading.Event,
+    grace: float = 3.0,
+    interval: float = 0.5,
+) -> None:
+    """Report progress from the growing ``.part`` file while yt-dlp stays silent.
+
+    yt-dlp's external downloaders call the progress hook once, at the very
+    end: ffmpeg downloads AES-128 HLS that way when pycryptodomex is missing.
+    For those runs the output file is the only live signal.
+    """
+    if hooked.wait(grace):
+        return
+    last_size = 0
+    last_time = time.monotonic()
+    while not stop.wait(interval):
+        if hooked.is_set():
+            return
+        size = _part_bytes(out_path)
+        if size <= 0:
+            continue
+        now = time.monotonic()
+        elapsed = now - last_time
+        speed = (
+            (size - last_size) / elapsed if elapsed > 0 and size > last_size else None
+        )
+        last_size, last_time = size, now
+        emit(ProgressSample(downloaded=size, total=total, speed=speed))
+
+
 def download(
     media_url: str,
     out_path: str,
     fmt: str = "best",
     verbose: bool = False,
     concurrent_fragments: int = 8,
-    progress_cb: Callable[[float], None] | None = None,
+    progress_cb: Callable[[ProgressSample], None] | None = None,
     show_progress: bool = True,
+    total_bytes: int | None = None,
 ) -> None:
-    """Download an HLS URL with yt-dlp and display Rich progress."""
+    """Download an HLS URL with yt-dlp and report bytes, speed and progress."""
     if concurrent_fragments < 1:
         raise IyfError("concurrent_fragments must be at least 1")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    reporting = progress_cb is not None or show_progress
+    total = total_bytes
+    if total is None and reporting:
+        # Probing before the download starts keeps these HEAD requests out of
+        # the fragment traffic: run concurrently they compete for the same
+        # connections and can outlast the download, leaving the display
+        # without a denominator.
+        total = probe_total_bytes(media_url)
     progress = Progress(
         TextColumn("{task.description}"),
         BarColumn(),
-        TextColumn("{task.percentage:>5.1f}%"),
+        DownloadColumn(),
+        TransferSpeedColumn(),
         TimeRemainingColumn(),
         disable=not show_progress,
     )
@@ -331,48 +530,67 @@ def download(
         "noplaylist": True,
         "no_warnings": not verbose,
         "quiet": not verbose,
+        # yt-dlp's own progress bar ignores ``quiet``; only ``noprogress``
+        # silences it, and the native HLS downloader prints one.
+        "noprogress": not verbose,
         "hls_prefer_native": True,
         "concurrent_fragment_downloads": concurrent_fragments,
     }
+    hooked = threading.Event()
+    stop = threading.Event()
     with progress:
-        task_id = progress.add_task(Path(out_path).name, total=100.0)
+        task_id = progress.add_task(
+            Path(out_path).name, total=float(total) if total else None
+        )
+
+        def emit(sample: ProgressSample) -> None:
+            if show_progress:
+                if sample.total is not None:
+                    progress.update(task_id, total=float(sample.total))
+                if sample.downloaded is not None:
+                    completed = float(sample.downloaded)
+                    if sample.total:
+                        completed = min(completed, float(sample.total))
+                    progress.update(task_id, completed=completed)
+            if progress_cb is not None:
+                progress_cb(sample)
 
         def progress_hook(data: dict[str, object]) -> None:
             status = data.get("status")
             if status not in {"downloading", "finished"}:
                 return
-            if status == "finished":
-                percentage = 100.0
-            else:
-                value = data.get("_percent_str")
-                if isinstance(value, str):
-                    try:
-                        percentage = float(value.replace("%", "").strip())
-                    except ValueError:
-                        return
-                else:
-                    raw_percentage = data.get("_percent")
-                    if isinstance(raw_percentage, (int, float)):
-                        percentage = float(raw_percentage)
-                    else:
-                        fragment_index = data.get("fragment_index")
-                        fragment_count = data.get("fragment_count")
-                        if not (
-                            isinstance(fragment_index, int)
-                            and isinstance(fragment_count, int)
-                            and fragment_count > 0
-                        ):
-                            return
-                        percentage = fragment_index / fragment_count * 100
-            progress.update(task_id, completed=percentage)
-            if progress_cb is not None:
-                progress_cb(percentage)
+            hooked.set()
+            downloaded = data.get("downloaded_bytes")
+            speed = data.get("speed")
+            emit(
+                ProgressSample(
+                    downloaded=int(downloaded)
+                    if isinstance(downloaded, (int, float))
+                    else None,
+                    total=total,
+                    speed=float(speed) if isinstance(speed, (int, float)) else None,
+                    finished=status == "finished",
+                )
+            )
 
         options["progress_hooks"] = [progress_hook]
+        watcher: threading.Thread | None = None
+        if reporting:
+            watcher = threading.Thread(
+                target=_watch_part_file,
+                args=(out_path, total, emit, hooked, stop),
+                name="iyf-size-watch",
+                daemon=True,
+            )
+            watcher.start()
         try:
             with yt_dlp.YoutubeDL(options) as ydl:  # pyright: ignore[reportArgumentType]
                 result = ydl.download([media_url])
         except Exception as error:
             raise IyfError(f"yt-dlp failed: {error}") from error
+        finally:
+            stop.set()
+        if watcher is not None:
+            watcher.join(timeout=2.0)
         if result != 0:
             raise IyfError(f"yt-dlp exited with code {result}")

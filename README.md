@@ -83,6 +83,16 @@ comma-separated values and ranges such as `1,3-5,23`.
 yt-dlp logs are hidden by default; use `-V`/`--verbose` to show them.
 `-N`/`--concurrent-fragments` defaults to 8 and controls yt-dlp HLS fragment concurrency.
 
+Downloads report bytes and transfer speed rather than a percentage:
+`生活大爆炸 S07E01 ━━━╸ 183.5/296.2 MB 21.4 MB/s 0:06`. The byte total comes
+from one `HEAD` request per segment, sent before the download starts (about
+1-2 seconds for a 20 minute episode) because yt-dlp's own estimate for HLS
+swings by more than 2x early on. `pycryptodomex` makes yt-dlp use its native
+HLS downloader, which supplies the live byte counts; when a stream still ends
+up on the ffmpeg downloader (or no total can be measured) the bar falls back
+to the growing `.part` file and shows bytes without a denominator. ffmpeg
+(and ffprobe) is still needed to remux the transport stream into mp4.
+
 Running `iyf` without a command starts the interactive CLI: enter a query,
 choose a numbered candidate, then enter `all` or an episode selection expression.
 
