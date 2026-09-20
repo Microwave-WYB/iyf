@@ -61,6 +61,105 @@ def query(text: str) -> list[engine.SearchResult]:
     return engine.search(text)
 
 
+_MAX_QUALITY_SEARCH_MATCHES = 3
+_MAX_QUALITY_LINES_PER_MATCH = 6
+
+
+@dataclass(frozen=True)
+class _SourceSelection:
+    search_index: int
+    result: engine.SearchResult
+    series: engine.Series
+    line: engine.Line
+    inspection: engine.PlaylistInspection
+
+    @property
+    def source(self) -> engine.Source:
+        return engine.Source(self.result.show_id, line=self.line.number)
+
+
+def _inspect_line(show_id: str, line: engine.Line) -> engine.PlaylistInspection | None:
+    if not line.episodes:
+        return None
+    try:
+        stream_url = engine.get_play_info(
+            show_id, line.number, line.episodes[0].number
+        ).stream_url
+        inspection = engine.inspect_playlist_url(stream_url)
+    except engine.IyfError:
+        return None
+    return inspection if inspection.valid else None
+
+
+def _select_quality_line(
+    series: engine.Series,
+) -> tuple[engine.Line, engine.PlaylistInspection] | None:
+    fallback: tuple[engine.Line, engine.PlaylistInspection] | None = None
+    best: tuple[engine.Line, engine.PlaylistInspection] | None = None
+    # Six lines covers current shows while bounding each match's fan-out.
+    for line in sorted(series.lines, key=lambda item: item.number)[
+        :_MAX_QUALITY_LINES_PER_MATCH
+    ]:
+        # Tags cannot reveal cadence when equal (as on lines 2/3), so sorted
+        # line order makes the lower line number the deterministic tie-break.
+        inspection = _inspect_line(series.show_id, line)
+        if inspection is None:
+            continue
+        if fallback is None:
+            fallback = (line, inspection)
+        if not inspection.declared:
+            continue
+        if best is None or engine.playlist_quality_key(
+            inspection.quality
+        ) > engine.playlist_quality_key(best[1].quality):
+            best = (line, inspection)
+    return best or fallback
+
+
+def _pick_query_source(
+    source: str, matches: list[engine.SearchResult] | None = None
+) -> _SourceSelection | None:
+    matches = query(source) if matches is None else matches
+    if not matches:
+        raise engine.IyfError(f"no matches for query {source!r}")
+
+    candidates: list[_SourceSelection] = []
+    # Quality selection covers at most 3 matches × 6 lines = 18 line checks.
+    # Each line uses 1 root playlist + up to 4 expansion requests: 90 playlist
+    # requests total. Variants beyond the remaining budget are not attempted.
+    for search_index, match in enumerate(matches[:_MAX_QUALITY_SEARCH_MATCHES]):
+        try:
+            series = engine.get_show(match.show_id)
+        except engine.IyfError:
+            continue
+        choice = _select_quality_line(series)
+        if choice is None:
+            continue
+        line, inspection = choice
+        candidates.append(
+            _SourceSelection(search_index, match, series, line, inspection)
+        )
+
+    declared = [candidate for candidate in candidates if candidate.inspection.declared]
+    if declared:
+        return max(
+            declared,
+            key=lambda candidate: (
+                *engine.playlist_quality_key(candidate.inspection.quality),
+                -candidate.search_index,
+                -candidate.line.number,
+            ),
+        )
+    return (
+        min(
+            candidates,
+            key=lambda candidate: (candidate.search_index, candidate.line.number),
+        )
+        if candidates
+        else None
+    )
+
+
 def _source(source: str) -> engine.Source:
     if _supported_url(source):
         source = _validate_link(source)
@@ -70,10 +169,16 @@ def _source(source: str) -> engine.Source:
 
     if source.lower().startswith(("http://", "https://")):
         raise engine.IyfError("link must be an http(s) iyf.tv or iyf.lv URL")
+    if source.isdigit():
+        return engine.parse_input(source)
+
     matches = query(source)
     if not matches:
         raise engine.IyfError(f"no matches for query {source!r}")
-    return engine.Source(matches[0].show_id)
+    selection = _pick_query_source(source, matches)
+    return (
+        selection.source if selection is not None else engine.Source(matches[0].show_id)
+    )
 
 
 def _select_episodes(

@@ -74,6 +74,9 @@ iyf d "show name" -e all --json
 
 Search JSON is a list of `{ "show_id": ..., "title": ... }` objects; download JSON is a list of `{ "path": ... }` objects. Rich progress and yt-dlp logs are disabled in JSON mode.
 
+
+Name-query quality selection is bounded to the first 3 search results and first 6 lines per result. Within that bounded set it selects the highest declared-quality valid HLS line. Each inspected line makes at most 5 playlist requests (1 root plus up to 4 expansions), so the 18-line cap allows at most 90 playlist requests. If a master has more variants than the remaining budget, only the highest-ranked remaining variants are tried. The interactive candidate table still enumerates all search results (existing behavior, outside this quality-selection cap). Identical quality tags use the lower line number, and explicit iyfplay/iyftv URLs and numeric IDs remain pinned instead of being upgraded. Child playlists use the fixed User-Agent/Referer; a production CDN requiring extra headers, cookies, or signed child URIs may make that line appear invalid. This is metadata selection only; it does not sample media with ffmpeg.
+
 When `-o` is omitted, files are saved under
 `iyf_downloads/<resolved series-or-movie name>/`. When provided, `-o` is always
 treated as an output directory; iyf generates each filename automatically.

@@ -4,9 +4,10 @@ import html
 import json
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
+from urllib.parse import urljoin
 
 import httpx
 import yt_dlp
@@ -78,6 +79,207 @@ class PlayInfo:
 
     stream_url: str
     media_class: str | None = None
+
+
+@dataclass(frozen=True)
+class PlaylistQuality:
+    """Declared quality metadata from an HLS playlist."""
+
+    width: int | None = None
+    height: int | None = None
+    bandwidth: int | None = None
+    frame_rate: float | None = None
+
+
+@dataclass(frozen=True)
+class PlaylistInspection:
+    """Validity and declared quality found in one HLS playlist."""
+
+    valid: bool
+    quality: PlaylistQuality | None = None
+    duration: float = 0.0
+
+    @property
+    def declared(self) -> bool:
+        return self.quality is not None
+
+
+_MAX_PLAYLIST_EXPANSIONS = 4
+_MAX_PLAYLIST_REQUESTS_PER_LINE = 5
+
+
+def _hls_attribute(tag: str, name: str) -> str | None:
+    match = re.search(rf"(?:^|[:,]){name}=(\"[^\"]*\"|[^,]+)", tag)
+    if not match:
+        return None
+    return match.group(1).strip('"')
+
+
+def playlist_quality_key(quality: PlaylistQuality | None) -> tuple[float, ...]:
+    """Return the declared-quality ordering used for line selection."""
+    if quality is None:
+        return (-1, -1, -1, -1)
+    return (
+        quality.height if quality.height is not None else -1,
+        quality.width if quality.width is not None else -1,
+        quality.bandwidth if quality.bandwidth is not None else -1,
+        quality.frame_rate if quality.frame_rate is not None else -1,
+    )
+
+
+def playlist_quality_label(inspection: PlaylistInspection) -> str:
+    """Return a concise human-readable explanation for a selected playlist."""
+    quality = inspection.quality
+    if quality is None:
+        return "未声明画质"
+    if quality.width is not None and quality.height is not None:
+        return f"{quality.width}x{quality.height}"
+    if quality.bandwidth is not None:
+        return f"{quality.bandwidth} bps"
+    return "已声明质量"
+
+
+def _playlist_duration(lines: list[str]) -> float:
+    durations: list[float] = []
+    for line in lines:
+        if not line.startswith("#EXTINF:"):
+            continue
+        raw_duration = line.removeprefix("#EXTINF:").split(",", 1)[0]
+        try:
+            durations.append(float(raw_duration))
+        except ValueError:
+            continue
+    return sum(durations)
+
+
+@dataclass
+class _PlaylistRequestContext:
+    requests: int = 0
+    visited: set[str] = field(default_factory=set)
+    responses: dict[str, str | None] = field(default_factory=dict)
+    inspections: dict[str, PlaylistInspection] = field(default_factory=dict)
+    active: set[str] = field(default_factory=set)
+
+    def fetch(self, url: str) -> str | None:
+        if url in self.responses:
+            return self.responses[url]
+        if self.requests >= _MAX_PLAYLIST_REQUESTS_PER_LINE:
+            return None
+        self.visited.add(url)
+        self.requests += 1
+        try:
+            text = _http_get(url)
+        except IyfError:
+            text = None
+        self.responses[url] = text
+        return text
+
+
+def _inspect_playlist(
+    text: str,
+    base_url: str | None,
+    depth: int,
+    context: _PlaylistRequestContext,
+) -> PlaylistInspection:
+    if base_url:
+        if base_url in context.inspections:
+            return context.inspections[base_url]
+        if base_url in context.active:
+            return PlaylistInspection(False)
+        context.active.add(base_url)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    variants: list[tuple[PlaylistQuality, str]] = []
+    for index, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        uri = next(
+            (item for item in lines[index + 1 :] if not item.startswith("#")),
+            None,
+        )
+        if uri is None:
+            continue
+        resolution = _hls_attribute(line, "RESOLUTION")
+        width: int | None = None
+        height: int | None = None
+        if resolution and "x" in resolution:
+            raw_width, raw_height = resolution.split("x", 1)
+            if raw_width.isdigit() and raw_height.isdigit():
+                width, height = int(raw_width), int(raw_height)
+        bandwidth = _hls_attribute(line, "BANDWIDTH")
+        frame_rate = _hls_attribute(line, "FRAME-RATE")
+        try:
+            parsed_frame_rate = float(frame_rate) if frame_rate else None
+        except ValueError:
+            parsed_frame_rate = None
+        variants.append(
+            (
+                PlaylistQuality(
+                    width=width,
+                    height=height,
+                    bandwidth=int(bandwidth)
+                    if bandwidth and bandwidth.isdigit()
+                    else None,
+                    frame_rate=parsed_frame_rate,
+                ),
+                uri,
+            )
+        )
+
+    if variants:
+        ordered_variants = sorted(
+            variants,
+            key=lambda item: playlist_quality_key(item[0]),
+            reverse=True,
+        )
+        first_quality = ordered_variants[0][0]
+        result = PlaylistInspection(False, first_quality)
+        if depth < _MAX_PLAYLIST_EXPANSIONS:
+            for quality, uri in ordered_variants:
+                variant_url = urljoin(base_url or "", uri)
+                if not variant_url.startswith(("http://", "https://")):
+                    continue
+                child_text = context.fetch(variant_url)
+                if child_text is None:
+                    continue
+                child = _inspect_playlist(child_text, variant_url, depth + 1, context)
+                if child.valid:
+                    result = PlaylistInspection(
+                        True,
+                        quality if quality != PlaylistQuality() else None,
+                        child.duration,
+                    )
+                    break
+    else:
+        result = PlaylistInspection(
+            _playlist_duration(lines) > 0,
+            duration=_playlist_duration(lines),
+        )
+
+    if base_url:
+        context.active.discard(base_url)
+        context.inspections[base_url] = result
+    return result
+
+
+def inspect_playlist(
+    text: str, base_url: str | None = None, _depth: int = 0
+) -> PlaylistInspection:
+    """Validate an HLS playlist and return its declared quality metadata."""
+    context = _PlaylistRequestContext(requests=1)
+    if base_url:
+        context.visited.add(base_url)
+        context.responses[base_url] = text
+    return _inspect_playlist(text, base_url, _depth, context)
+
+
+def inspect_playlist_url(url: str) -> PlaylistInspection:
+    """Fetch and inspect one line's playlist within its request budget."""
+    context = _PlaylistRequestContext()
+    text = context.fetch(url)
+    if text is None:
+        return PlaylistInspection(False)
+    return _inspect_playlist(text, url, 0, context)
 
 
 class DownloadParams(TypedDict, total=False):
