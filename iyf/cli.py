@@ -6,7 +6,13 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from . import IyfError, engine, skill_text
+from . import (
+    IyfError,
+    _pick_query_source,
+    _select_quality_line,
+    engine,
+    skill_text,
+)
 from . import download as download_video
 from . import query as search_shows
 from .render import Candidate, candidates_table, episodes_table, search_results_table
@@ -28,12 +34,33 @@ def _download(
     verbose: bool,
     concurrent_fragments: int,
     json_output: bool,
+    selection_message: str | None = None,
 ) -> None:
-    if not json_output:
-        console.print("正在请求 iyf API 并解析视频信息，请稍候…", style="dim")
+    resolved_source = source
     try:
+        if (
+            not json_output
+            and not source.lower().startswith(("http://", "https://"))
+            and not source.strip().isdigit()
+        ):
+            selection = _pick_query_source(source)
+            if selection is not None:
+                resolved_source = (
+                    f"https://www.iyf.lv/iyfplay/"
+                    f"{selection.result.show_id}-{selection.line.number}-1/"
+                )
+                selection_message = (
+                    f"已选择：{selection.result.title} 线路 "
+                    f"{selection.line.number}（"
+                    f"{engine.playlist_quality_label(selection.inspection)}）"
+                )
+        if not json_output:
+            console.print(
+                selection_message or "正在请求 iyf API 并解析视频信息，请稍候…",
+                style="dim",
+            )
         destinations = download_video(
-            source,
+            resolved_source,
             output,
             episode,
             verbose=verbose and not json_output,
@@ -75,6 +102,8 @@ def _interactive(verbose: bool = False) -> None:
         return
 
     candidates: list[Candidate] = []
+    # Existing behavior: enumerate every match for the candidate table; this
+    # one show/play lookup per match is outside the quality-selection limits.
     for result in matches:
         media_class = "视频"
         try:
@@ -101,7 +130,27 @@ def _interactive(verbose: bool = False) -> None:
         raise typer.Exit(1)
 
     candidate = candidates[target - 1]
-    source = f"https://www.iyf.lv/iyftv/{candidate.result.show_id}/"
+    selection_message = None
+    quality_choice = _select_quality_line(candidate.series)
+    if quality_choice is not None:
+        quality_line = quality_choice[0]
+        candidate = Candidate(
+            candidate.result,
+            candidate.series,
+            quality_choice[0],
+            candidate.media_class,
+        )
+        selection_message = (
+            f"已选择：{candidate.series.title} 线路 {quality_line.number}（"
+            f"{engine.playlist_quality_label(quality_choice[1])}）"
+        )
+    if candidate.line:
+        source = (
+            f"https://www.iyf.lv/iyfplay/"
+            f"{candidate.result.show_id}-{candidate.line.number}-1/"
+        )
+    else:
+        source = f"https://www.iyf.lv/iyftv/{candidate.result.show_id}/"
     if candidate.line and candidate.line.episodes:
         console.print(episodes_table(candidate.line))
         typer.echo("分集选择示例：")
@@ -111,7 +160,7 @@ def _interactive(verbose: bool = False) -> None:
         selector = typer.prompt("输入分集", default="all")
     else:
         selector = None
-    _download(source, None, selector, verbose, 8, False)
+    _download(source, None, selector, verbose, 8, False, selection_message)
 
 
 @app.callback()

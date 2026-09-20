@@ -125,3 +125,5 @@ paths = download("剧名", episode="1-3")
 ```
 
 `resolve()` returns one `Video` and raises if multiple episodes are selected. Use `resolve_all()` for multiple episodes. Default output is `iyf_downloads/<series-or-movie>/<video>.mp4`.
+
+Name-query quality selection is bounded to the first 3 search results and first 6 lines per result. Within that bounded set it chooses the highest declared-quality valid HLS line. Each inspected line makes at most 5 playlist requests (1 root plus up to 4 expansions), so the 18-line cap allows at most 90 playlist requests. If a master has more variants than the remaining budget, only the highest-ranked remaining variants are tried. The interactive candidate table still enumerates all search results (existing behavior, outside this quality-selection cap). Equal tags are tied by lower line number; tags do not reveal undeclared frame-rate differences. Explicit iyfplay/iyftv URLs and numeric IDs remain pinned. Child playlists use the fixed User-Agent/Referer; a production CDN requiring extra headers, cookies, or signed child URIs may make that line appear invalid. No media quality probing is performed.
