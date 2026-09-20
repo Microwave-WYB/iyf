@@ -1,0 +1,7 @@
+{"timestamp":"2026-09-05T04:38:00.385Z","event":"oncall.workspace_restore_disabled","details":{"reason":"session_unavailable"}}
+{"timestamp":"2026-09-06T04:22:09.387Z","event":"oncall.workspace_restore_disabled","details":{"reason":"session_unavailable"}}
+{"timestamp":"2026-09-06T04:22:10.365Z","event":"oncall.workspace_restore_disabled","details":{"reason":"session_unavailable"}}
+{"timestamp":"2026-09-06T04:22:10.501Z","event":"oncall.workspace_restore_disabled","details":{"reason":"session_unavailable"}}
+{"timestamp":"2026-09-06T04:22:11.425Z","event":"oncall.workspace_restore_disabled","details":{"reason":"session_unavailable"}}
+{"timestamp":"2026-09-06T06:42:00.302Z","event":"oncall.workspace_restore_disabled","details":{"reason":"session_unavailable"}}
+{"timestamp":"2026-09-06T06:42:01.300Z","event":"oncall.workspace_restore_skipped","details":{"reason":"not_selected","sessionId":"01a074f3-cfff-711a-b6fa-c36ad6ca80a5","workspace":"/home/wyb/Projects/iyf-cli"}}

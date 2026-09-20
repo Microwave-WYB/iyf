@@ -8,32 +8,68 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    Task,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+from rich.text import Text
+
+from .engine import ProgressSample
 
 if TYPE_CHECKING:
     from . import Video
 
 
+class _ByteColumn(DownloadColumn):
+    """``DownloadColumn`` that stays empty for tasks that do not count bytes."""
+
+    def render(self, task: Task) -> Text:
+        if not task.fields.get("bytes"):
+            return Text("")
+        return super().render(task)
+
+
+class _ByteSpeedColumn(TransferSpeedColumn):
+    """``TransferSpeedColumn`` that stays empty for tasks that do not count bytes."""
+
+    def render(self, task: Task) -> Text:
+        if not task.fields.get("bytes"):
+            return Text("")
+        return super().render(task)
+
+
 @dataclass
 class ProgressEvent:
-    """A progress update for one selected episode."""
+    """One live sample, or the completion of an episode when ``sample`` is None."""
 
     episode_index: int
-    percent: float
-    finished: bool = False
+    sample: ProgressSample | None = None
 
 
 def _render(videos: list[Video], events: queue.Queue[ProgressEvent | None]) -> None:
+    # Bytes, not percentages: DownloadColumn needs a byte total and
+    # TransferSpeedColumn derives the rate from update cadence, so this only
+    # has to forward ``downloaded`` and ``total``.
     progress = Progress(
         TextColumn("{task.description}"),
         BarColumn(),
-        TextColumn("{task.percentage:>5.1f}%"),
+        _ByteColumn(),
+        _ByteSpeedColumn(),
         TimeRemainingColumn(),
     )
     with progress:
-        first_video = videos[0]
         current_id = progress.add_task(
-            first_video.episode_title, total=100.0, visible=False
+            videos[0].episode_title,
+            total=None,
+            visible=False,
+            # ``add_task`` takes fields as keywords: ``bytes=True`` becomes
+            # ``task.fields["bytes"]``, which the byte columns look for.
+            bytes=True,
         )
         overall_id = progress.add_task("总进度", total=len(videos))
         current_visible = False
@@ -43,28 +79,47 @@ def _render(videos: list[Video], events: queue.Queue[ProgressEvent | None]) -> N
             if event is None:
                 return
             video = videos[event.episode_index]
-            if 0.0 < event.percent < 100.0:
-                if not current_visible:
-                    progress.update(current_id, visible=True)
-                    current_visible = True
-                progress.update(
-                    current_id,
-                    description=video.episode_title,
-                    completed=event.percent,
-                )
-            elif event.percent >= 100.0 and not current_visible and not warning_shown:
-                progress.console.print(
-                    "当前分集无法获取实时进度，仅显示总进度。", style="yellow"
-                )
-                warning_shown = True
-            if event.finished:
-                if current_visible:
-                    progress.update(
-                        current_id,
-                        description=video.episode_title,
-                        completed=100.0,
+            if event.sample is None:
+                if not current_visible and not warning_shown:
+                    progress.console.print(
+                        "本集无法获取实时进度，仅显示总进度。", style="yellow"
                     )
+                    warning_shown = True
+                if current_visible:
+                    progress.update(current_id, visible=False)
+                    current_visible = False
+                # Rich's ``update`` and ``reset`` treat ``total=None`` as
+                # "keep the current total", so clear it directly: the next
+                # episode may have no measured total and must not inherit
+                # this denominator or this episode's speed samples.
+                progress.reset(current_id, start=False)
+                progress.tasks[current_id].total = None
                 progress.update(overall_id, advance=1)
+                continue
+            sample = event.sample
+            if sample.total is not None:
+                progress.update(current_id, total=float(sample.total))
+            if sample.downloaded is None:
+                continue
+            if not current_visible:
+                progress.update(
+                    current_id, description=video.episode_title, visible=True
+                )
+                progress.start_task(current_id)
+                current_visible = True
+            task = progress.tasks[current_id]
+            total = float(task.total) if task.total else None
+            completed = float(sample.downloaded)
+            if total is not None:
+                completed = min(completed, total)
+            # Both yt-dlp hooks and the .part watcher report, so samples can
+            # arrive out of order and the bar must not move backwards — but a
+            # denominator that only arrives late can still be smaller than the
+            # bytes already reported, and then it wins.
+            previous = float(task.completed)
+            if total is not None:
+                previous = min(previous, total)
+            progress.update(current_id, completed=max(previous, completed))
 
 
 class ProgressRenderer:
@@ -80,17 +135,17 @@ class ProgressRenderer:
         )
         self._thread.start()
 
-    def callback(self, episode_index: int) -> Callable[[float], None]:
+    def callback(self, episode_index: int) -> Callable[[ProgressSample], None]:
         """Return a tiny yt-dlp hook that only enqueues progress."""
 
-        def enqueue(percent: float) -> None:
-            self._events.put(ProgressEvent(episode_index, percent))
+        def enqueue(sample: ProgressSample) -> None:
+            self._events.put(ProgressEvent(episode_index, sample))
 
         return enqueue
 
     def finish(self, episode_index: int) -> None:
         """Mark one episode complete."""
-        self._events.put(ProgressEvent(episode_index, 100.0, finished=True))
+        self._events.put(ProgressEvent(episode_index))
 
     def close(self) -> None:
         """Stop the renderer after all queued events have been consumed."""
