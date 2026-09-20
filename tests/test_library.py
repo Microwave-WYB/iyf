@@ -1,0 +1,226 @@
+"""Unit tests for the media-library layout, .strm writing and refresh."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import iyf
+from iyf import (
+    SIDECAR_NAME,
+    Video,
+    engine,
+    library_path,
+    refresh_streams,
+    write_streams,
+)
+
+
+def series_video(
+    episode: str = "2", season: int = 1, name: str = "权力的游戏"
+) -> Video:
+    return Video(
+        link="https://www.iyf.lv/iyftv/95676/",
+        show_id="95676",
+        line=2,
+        show_name=name,
+        season=season,
+        episode=episode,
+        episode_title=f"第{episode}集",
+        media_class="欧美",
+        stream_url="https://cdn.example/old/index.m3u8",
+        is_series=True,
+    )
+
+
+def single_video() -> Video:
+    return Video(
+        link="https://www.iyf.lv/iyftv/101575/",
+        show_id="101575",
+        line=1,
+        show_name="权力的游戏：最后的守夜人",
+        season=1,
+        episode="1",
+        episode_title="正片",
+        media_class="纪录",
+        stream_url="https://cdn.example/movie/index.m3u8",
+        is_series=False,
+    )
+
+
+class LayoutTest(unittest.TestCase):
+    def test_series_paths_use_a_season_folder(self) -> None:
+        video = series_video(episode="3", season=7, name="生活大爆炸")
+        self.assertEqual(
+            library_path("iyf_downloads", video, video.filename),
+            Path("iyf_downloads/生活大爆炸/Season 07/生活大爆炸 S07E03.mp4"),
+        )
+        self.assertEqual(
+            library_path("/mnt/media", video, video.stream_filename),
+            Path("/mnt/media/生活大爆炸/Season 07/生活大爆炸 S07E03.strm"),
+        )
+
+    def test_single_videos_are_not_named_like_episodes(self) -> None:
+        video = single_video()
+        self.assertEqual(video.filename, "权力的游戏：最后的守夜人.mp4")
+        self.assertEqual(video.stream_filename, "权力的游戏：最后的守夜人.strm")
+        self.assertEqual(
+            library_path("/mnt/media", video, video.stream_filename),
+            Path("/mnt/media/权力的游戏：最后的守夜人/权力的游戏：最后的守夜人.strm"),
+        )
+
+    def test_output_root_replaces_the_default_one(self) -> None:
+        video = series_video()
+        self.assertEqual(
+            library_path("/mnt/storage/media", video, video.filename),
+            Path("/mnt/storage/media/权力的游戏/Season 01/权力的游戏 S01E02.mp4"),
+        )
+
+
+class WriteStreamsTest(unittest.TestCase):
+    def test_writes_single_line_url_and_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(iyf, "resolve_all", return_value=[series_video()]):
+                paths = write_streams("权力的游戏 第一季", directory, "1-2")
+            self.assertEqual(
+                paths,
+                [Path(directory) / "权力的游戏/Season 01/权力的游戏 S01E02.strm"],
+            )
+            self.assertEqual(
+                paths[0].read_text(encoding="utf-8"),
+                "https://cdn.example/old/index.m3u8\n",
+            )
+            sidecar = json.loads(
+                (Path(directory) / "权力的游戏" / SIDECAR_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                sidecar, {"show_id": "95676", "line": 2, "title": "权力的游戏"}
+            )
+
+
+class _StubEngine:
+    """Stand in for the engine calls refresh_streams makes."""
+
+    def __init__(self, url: str, valid: bool = True) -> None:
+        self.url = url
+        self.valid = valid
+
+    def __enter__(self) -> "_StubEngine":
+        self._patches = [
+            mock.patch.object(engine, "get_show", side_effect=self._get_show),
+            mock.patch.object(engine, "get_play_info", side_effect=self._play_info),
+            mock.patch.object(
+                engine,
+                "inspect_playlist_url",
+                return_value=engine.PlaylistInspection(valid=self.valid, duration=60.0),
+            ),
+        ]
+        for patch in self._patches:
+            patch.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        for patch in self._patches:
+            patch.stop()
+
+    @staticmethod
+    def _get_show(show_id: str) -> engine.Series:
+        episodes = [engine.Episode("1", "第1集"), engine.Episode("2", "第2集")]
+        # Real entries expose several lines; sidebar fixtures use line 1 and 2.
+        return engine.Series(
+            show_id,
+            "权力的游戏 第一季",
+            [engine.Line(1, episodes), engine.Line(2, episodes)],
+        )
+
+    def _play_info(self, show_id: str, line: int, episode: str) -> engine.PlayInfo:
+        return engine.PlayInfo(self.url, "欧美")
+
+
+class RefreshStreamsTest(unittest.TestCase):
+    def _library(self, directory: str) -> tuple[Path, Path]:
+        series = Path(directory) / "权力的游戏"
+        episode = series / "Season 01" / "权力的游戏 S01E02.strm"
+        episode.parent.mkdir(parents=True, exist_ok=True)
+        episode.write_text("https://cdn.example/old/index.m3u8\n", encoding="utf-8")
+        (series / SIDECAR_NAME).write_text(
+            json.dumps({"show_id": "95676", "line": 2, "title": "权力的游戏"}),
+            encoding="utf-8",
+        )
+        return series, episode
+
+    def test_unchanged_url_is_reported_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, episode = self._library(directory)
+            with _StubEngine("https://cdn.example/old/index.m3u8"):
+                statuses = refresh_streams(directory)
+        self.assertEqual([item.status for item in statuses], ["ok"])
+        self.assertEqual(statuses[0].path.name, "权力的游戏 S01E02.strm")
+
+    def test_changed_url_is_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, episode = self._library(directory)
+            with _StubEngine("https://cdn.example/new/index.m3u8"):
+                statuses = refresh_streams(directory)
+            self.assertEqual([item.status for item in statuses], ["updated"])
+            self.assertEqual(
+                episode.read_text(encoding="utf-8"),
+                "https://cdn.example/new/index.m3u8\n",
+            )
+
+    def test_check_only_never_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, episode = self._library(directory)
+            with _StubEngine("https://cdn.example/new/index.m3u8"):
+                statuses = refresh_streams(directory, check_only=True)
+            self.assertEqual([item.status for item in statuses], ["updated"])
+            self.assertEqual(
+                episode.read_text(encoding="utf-8"),
+                "https://cdn.example/old/index.m3u8\n",
+            )
+
+    def test_unplayable_playlist_is_broken(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, episode = self._library(directory)
+            with _StubEngine("https://cdn.example/new/index.m3u8", valid=False):
+                statuses = refresh_streams(directory)
+            self.assertEqual([item.status for item in statuses], ["broken"])
+            self.assertIn("not playable", statuses[0].detail)
+            self.assertEqual(
+                episode.read_text(encoding="utf-8"),
+                "https://cdn.example/old/index.m3u8\n",
+            )
+
+    def test_directories_without_a_sidecar_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stray = Path(directory) / "somewhere" / "x.strm"
+            stray.parent.mkdir(parents=True)
+            stray.write_text("https://cdn.example/x.m3u8\n", encoding="utf-8")
+            self.assertEqual(refresh_streams(directory), [])
+
+    def test_single_video_file_uses_the_only_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            series = Path(directory) / "权力的游戏：最后的守夜人"
+            series.mkdir(parents=True)
+            movie = series / "权力的游戏：最后的守夜人.strm"
+            movie.write_text("https://cdn.example/old/index.m3u8\n", encoding="utf-8")
+            (series / SIDECAR_NAME).write_text(
+                json.dumps({"show_id": "101575", "line": 1, "title": "守夜人"}),
+                encoding="utf-8",
+            )
+            with _StubEngine("https://cdn.example/new/index.m3u8"):
+                statuses = refresh_streams(directory)
+            self.assertEqual([item.status for item in statuses], ["updated"])
+            self.assertEqual(
+                movie.read_text(encoding="utf-8"),
+                "https://cdn.example/new/index.m3u8\n",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

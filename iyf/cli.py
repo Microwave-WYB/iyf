@@ -11,7 +11,9 @@ from . import (
     _pick_query_source,
     _select_quality_line,
     engine,
+    refresh_streams,
     skill_text,
+    write_streams,
 )
 from . import download as download_video
 from . import query as search_shows
@@ -35,6 +37,7 @@ def _download(
     concurrent_fragments: int,
     json_output: bool,
     selection_message: str | None = None,
+    strm: bool = False,
 ) -> None:
     resolved_source = source
     try:
@@ -59,14 +62,17 @@ def _download(
                 selection_message or "正在请求 iyf API 并解析视频信息，请稍候…",
                 style="dim",
             )
-        destinations = download_video(
-            resolved_source,
-            output,
-            episode,
-            verbose=verbose and not json_output,
-            concurrent_fragments=concurrent_fragments,
-            progress=not (json_output or verbose),
-        )
+        if strm:
+            destinations = write_streams(resolved_source, output, episode)
+        else:
+            destinations = download_video(
+                resolved_source,
+                output,
+                episode,
+                verbose=verbose and not json_output,
+                concurrent_fragments=concurrent_fragments,
+                progress=not (json_output or verbose),
+            )
     except IyfError as error:
         typer.echo(f"错误：{error}", err=True)
         raise typer.Exit(1) from error
@@ -82,7 +88,7 @@ def _download(
         )
     else:
         for destination in destinations:
-            typer.echo(f"已保存到：{destination}")
+            typer.echo(f"{'已写入' if strm else '已保存到'}：{destination}")
 
 
 def _interactive(verbose: bool = False) -> None:
@@ -197,7 +203,7 @@ def download(
     output: Path | None = typer.Option(
         None,
         "-o",
-        help="输出目录（默认：iyf_downloads/<名称>/）",
+        help="媒体库根目录（默认：iyf_downloads/）",
     ),
     episode: str | None = typer.Option(
         None,
@@ -223,12 +229,23 @@ def download(
         "--json",
         help="以 JSON 输出结果。",
     ),
+    strm: bool = typer.Option(
+        False,
+        "--strm",
+        help="写入 .strm 流文件（指向 HLS 地址）而不下载视频。",
+    ),
 ) -> None:
-    """解析并下载一个或多个视频。"""
+    """解析并下载一个或多个视频，或用 --strm 写入流文件。"""
     if isinstance(ctx.obj, dict) and ctx.obj.get("verbose") is True:
         verbose = True
     _download(
-        link_or_query, output, episode, verbose, concurrent_fragments, json_output
+        link_or_query,
+        output,
+        episode,
+        verbose,
+        concurrent_fragments,
+        json_output,
+        strm=strm,
     )
 
 
@@ -265,6 +282,53 @@ def query(
         )
     else:
         console.print(search_results_table(matches))
+
+
+@app.command("refresh")
+def refresh(
+    path: Path = typer.Argument(..., help="媒体库根目录或单个剧集目录"),
+    check_only: bool = typer.Option(
+        False,
+        "--check-only",
+        help="只检查是否需要刷新，不重写文件。",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="以 JSON 输出结果。",
+    ),
+) -> None:
+    """重新解析已有 .strm 文件，重写过期的地址。"""
+    if not json_output:
+        console.print("正在重新解析流地址，请稍候…", style="dim")
+    try:
+        statuses = refresh_streams(path, check_only=check_only)
+    except IyfError as error:
+        typer.echo(f"错误：{error}", err=True)
+        raise typer.Exit(1) from error
+    if json_output:
+        typer.echo(
+            json.dumps(
+                [
+                    {
+                        "path": str(item.path),
+                        "status": item.status,
+                        "detail": item.detail,
+                    }
+                    for item in statuses
+                ],
+                ensure_ascii=False,
+            )
+        )
+    else:
+        if not statuses:
+            typer.echo("没有找到带 .iyf.json 的目录，未做任何修改。")
+        labels = {"ok": "正常", "updated": "已更新", "broken": "失效"}
+        for item in statuses:
+            suffix = f"（{item.detail}）" if item.detail else ""
+            typer.echo(f"{labels.get(item.status, item.status)}：{item.path}{suffix}")
+    if any(item.status == "broken" for item in statuses):
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

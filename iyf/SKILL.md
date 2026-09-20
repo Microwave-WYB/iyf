@@ -42,9 +42,48 @@ Output:
 ]
 ```
 
-Each item has `path: str`, the downloaded file path.
+Each item has `path: str`, the written file path.
 
-The `-o` option always specifies an output directory. Filenames are generated automatically; do not pass a file path to `-o`.
+Files use the media-library layout that Jellyfin, Emby, Plex and Kodi all read:
+`<root>/<title>/Season NN/<title> SxxExx.mp4`, or `<root>/<title>/<title>.mp4`
+for a single-video entry (a film or documentary). `-o` replaces the
+`iyf_downloads/` root and the layout below it stays the same, so
+`-o /mnt/storage/media` yields `/mnt/storage/media/生活大爆炸/Season 07/…`. Do not
+pass a file path to `-o`.
+
+`--strm` writes pointer files instead of downloading media, using the same
+layout with the `.strm` extension:
+
+```sh
+iyf d "剧名" -e all --strm -o /mnt/storage/media
+```
+
+Each `.strm` file holds only the resolved HLS URL, and the title directory gets
+an `.iyf.json` sidecar recording the show and line it was resolved from.
+
+### Refresh
+
+```sh
+iyf refresh /mnt/storage/media --check-only --json
+```
+
+Re-resolves the `.strm` files under a library root or a single title directory,
+rewriting the ones whose URL changed. `--check-only` reports without writing and
+exits non-zero when a file is stale or broken.
+
+Output:
+
+```json
+[
+  {
+    "path": "/mnt/storage/media/权力的游戏/Season 01/权力的游戏 S01E01.strm",
+    "status": "ok",
+    "detail": ""
+  }
+]
+```
+
+`status` is `ok`, `updated` or `broken`.
 
 Episode selectors accepted by `-e`/`--episode`:
 
@@ -78,6 +117,23 @@ class Video:
     episode_title: str
     media_class: str | None
     stream_url: str
+    is_series: bool = True
+
+    @property
+    def filename(self) -> str:
+        """mp4 filename: ``<title> SxxExx.mp4``, or ``<title>.mp4``."""
+
+    @property
+    def stream_filename(self) -> str:
+        """Same name with the ``.strm`` extension."""
+
+
+@dataclass
+class StreamStatus:
+    path: Path
+    status: str  # "ok", "updated" or "broken"
+    detail: str = ""
+    url: str | None = None
 
     @property
     def filename(self) -> str: ...
@@ -87,7 +143,19 @@ class Video:
 
 ```python
 from pathlib import Path
-from iyf import download, query, resolve, resolve_all
+from iyf import (
+    SIDECAR_NAME,
+    StreamStatus,
+    Video,
+    download,
+    library_path,
+    query,
+    refresh_streams,
+    resolve,
+    resolve_all,
+    series_directory,
+    write_streams,
+)
 
 
 def query(text: str) -> list[SearchResult]: ...
@@ -113,6 +181,25 @@ def download(
     concurrent_fragments: int = 8,
     progress: bool = True,
 ) -> list[Path]: ...
+
+
+def write_streams(
+    link_or_query: str,
+    output: str | Path | None = None,
+    episode: str | None = None,
+) -> list[Path]: ...
+
+
+def refresh_streams(
+    path: str | Path,
+    check_only: bool = False,
+) -> list[StreamStatus]: ...
+
+
+def library_path(root: str | Path, video: Video, filename: str) -> Path: ...
+
+
+def series_directory(root: str | Path, video: Video) -> Path: ...
 ```
 
 ### Usage
@@ -122,8 +209,10 @@ matches = query("生活大爆炸")
 video = resolve("https://www.iyf.lv/iyfplay/49615-1-2/")
 video_list = resolve_all("剧名", episode="1-3")
 paths = download("剧名", episode="1-3")
+streams = write_streams("剧名", episode="1-3", output="/mnt/storage/media")
+statuses = refresh_streams("/mnt/storage/media", check_only=True)
 ```
 
-`resolve()` returns one `Video` and raises if multiple episodes are selected. Use `resolve_all()` for multiple episodes. Default output is `iyf_downloads/<series-or-movie>/<video>.mp4`.
+`resolve()` returns one `Video` and raises if multiple episodes are selected. Use `resolve_all()` for multiple episodes. Files land in `iyf_downloads/<title>/Season NN/` (or `<title>/` for a single-video entry) unless `output` replaces that root; `library_path()` and `series_directory()` expose the same layout to callers that need to compute paths.
 
 Name-query quality selection is bounded to the first 3 search results and first 6 lines per result. Within that bounded set it chooses the highest declared-quality valid HLS line. Each inspected line makes at most 5 playlist requests (1 root plus up to 4 expansions), so the 18-line cap allows at most 90 playlist requests. If a master has more variants than the remaining budget, only the highest-ranked remaining variants are tried. The interactive candidate table still enumerates all search results (existing behavior, outside this quality-selection cap). Equal tags are tied by lower line number; tags do not reveal undeclared frame-rate differences. Explicit iyfplay/iyftv URLs and numeric IDs remain pinned. Child playlists use the fixed User-Agent/Referer; a production CDN requiring extra headers, cookies, or signed child URIs may make that line appear invalid. No media quality probing is performed.
