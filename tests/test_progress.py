@@ -245,27 +245,63 @@ class ProbeTotalBytesTest(unittest.TestCase):
                 engine.probe_total_bytes("https://cdn.example/index.m3u8"), 1_234
             )
 
-    def test_infinite_duration_does_not_raise(self) -> None:
+    def test_malformed_duration_returns_no_denominator(self) -> None:
+        # Keeping the URL but dropping its duration would silently drop that
+        # segment's bytes from the total, so nothing is reported instead.
         text = (
             "#EXTM3U\n"
-            "#EXTINF:1e309,\na.ts\n"
-            "#EXTINF:10.0,\nb.ts\n"
-            "#EXTINF:10.0,\nc.ts\n"
+            "#EXTINF:1e309,\nbad.ts\n"
+            "#EXTINF:10.0,\ngood1.ts\n"
+            "#EXTINF:10.0,\ngood2.ts\n"
             "#EXT-X-ENDLIST\n"
         )
         sizes = {
-            "https://cdn.example/a.ts": 1_000,
-            "https://cdn.example/b.ts": 1_000,
-            "https://cdn.example/c.ts": 1_000,
+            "https://cdn.example/bad.ts": 9_000,
+            "https://cdn.example/good1.ts": 1_000,
+            "https://cdn.example/good2.ts": 1_000,
         }
         with (
             mock.patch.object(engine, "_http_get", return_value=text),
             mock.patch.object(engine.httpx, "head", side_effect=fake_head(sizes)),
         ):
-            # The infinite duration is dropped, so 2 MB over 20 s scale to 20 s.
-            self.assertEqual(
-                engine.probe_total_bytes("https://cdn.example/index.m3u8"), 2_000
+            self.assertIsNone(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8")
             )
+
+    def test_zero_duration_segment_returns_no_denominator(self) -> None:
+        text = media_playlist([("a.ts", 0.0), ("b.ts", 10.0)])
+        sizes = {
+            "https://cdn.example/a.ts": 1_000,
+            "https://cdn.example/b.ts": 1_000,
+        }
+        with (
+            mock.patch.object(engine, "_http_get", return_value=text),
+            mock.patch.object(engine.httpx, "head", side_effect=fake_head(sizes)),
+        ):
+            self.assertIsNone(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8")
+            )
+
+    def test_playlist_reads_use_the_remaining_deadline(self) -> None:
+        seen: list[float] = []
+
+        def fetch(url: str, timeout: float = 30.0) -> str:
+            seen.append(timeout)
+            raise engine.IyfError("boom")
+
+        with mock.patch.object(engine, "_http_get", side_effect=fetch):
+            self.assertIsNone(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8", deadline=0.5)
+            )
+        self.assertTrue(seen)
+        self.assertLessEqual(seen[0], 0.5)
+
+    def test_expired_deadline_skips_the_playlist_read(self) -> None:
+        with mock.patch.object(engine, "_http_get") as fetch:
+            self.assertIsNone(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8", deadline=0.0)
+            )
+        fetch.assert_not_called()
 
 
 class DownloadOptionsTest(unittest.TestCase):
@@ -330,6 +366,18 @@ class DownloadOptionsTest(unittest.TestCase):
         ) as probe:
             self._run(progress_cb=lambda _sample: None)
         probe.assert_called_once_with(self.URL)
+
+
+class PartBytesTest(unittest.TestCase):
+    def test_glob_metacharacters_in_the_output_path_are_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            out_path = str(Path(directory) / "episode[0].mp4")
+            Path(directory, "episode0.mp4.part-Frag1").write_bytes(b"x" * 7)
+            self.assertEqual(engine._part_bytes(out_path), 0)
+
+            Path(f"{out_path}.part").write_bytes(b"x" * 3)
+            Path(f"{out_path}.part-Frag2").write_bytes(b"x" * 4)
+            self.assertEqual(engine._part_bytes(out_path), 7)
 
 
 class WatchPartFileTest(unittest.TestCase):

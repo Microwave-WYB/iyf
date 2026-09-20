@@ -10,6 +10,7 @@ import urllib.parse
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from glob import escape as glob_escape
 from glob import glob
 from pathlib import Path
 from typing import TypedDict
@@ -402,8 +403,11 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
         return max(deadline - (time.monotonic() - started), 0.0)
 
     def fetch(url: str) -> str | None:
+        left = remaining()
+        if left <= 0:
+            return None
         try:
-            return _http_get(url, timeout=max(remaining(), 1.0))
+            return _http_get(url, timeout=left)
         except IyfError:
             return None
 
@@ -423,9 +427,13 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
         # is not this download's total.
         return None
     urls, durations = _playlist_segments(text, media_url)
-    total_duration = sum(durations)
-    if not urls or total_duration <= 0:
+    if not urls or any(duration <= 0 for duration in durations):
+        # A segment with a missing, zero or malformed duration cannot be
+        # scaled, and skipping it would silently drop its bytes from the
+        # total: no denominator is better than a wrong one.
         return None
+
+    total_duration = sum(durations)
 
     def measure(index: int) -> tuple[int, float]:
         try:
@@ -445,12 +453,24 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
             return 0, durations[index]
 
     pool = ThreadPoolExecutor(max_workers=_SIZE_PROBE_WORKERS)
+    measured: list[tuple[int, float]] = []
     try:
-        futures = [pool.submit(measure, index) for index in range(len(urls))]
-        done, pending = wait(futures, timeout=remaining())
-        for future in pending:
-            future.cancel()
-        measured = [future.result() for future in done if future.exception() is None]
+        # Submit in windows so a huge playlist cannot queue thousands of
+        # requests past the deadline, and check the clock between windows.
+        window = _SIZE_PROBE_WORKERS * 4
+        for start in range(0, len(urls), window):
+            if remaining() <= 0:
+                break
+            batch = [
+                pool.submit(measure, index)
+                for index in range(start, min(start + window, len(urls)))
+            ]
+            done, pending = wait(batch, timeout=remaining())
+            for future in pending:
+                future.cancel()
+            measured.extend(
+                future.result() for future in done if future.exception() is None
+            )
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     usable = [
@@ -468,7 +488,7 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
 def _part_bytes(out_path: str) -> int:
     """Return the bytes written for ``out_path``, in-flight fragments included."""
     total = 0
-    for path in (f"{out_path}.part", *glob(f"{out_path}.part-*")):
+    for path in (f"{out_path}.part", *glob(f"{glob_escape(out_path)}.part-*")):
         try:
             total += Path(path).stat().st_size
         except OSError:
