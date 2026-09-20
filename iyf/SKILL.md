@@ -58,8 +58,10 @@ layout with the `.strm` extension:
 iyf d "剧名" -e all --strm -o /mnt/storage/media
 ```
 
-Each `.strm` file holds only the resolved HLS URL, and the title directory gets
-an `.iyf.json` sidecar recording the show and line it was resolved from.
+Each `.strm` file holds only the resolved HLS URL, and the directory holding the
+files (the season folder for a series) gets an `.iyf.json` sidecar recording the
+show and line it was resolved from. Each season keeps its own sidecar, because
+the seasons of one title share a title directory.
 
 ### Refresh
 

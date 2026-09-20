@@ -94,7 +94,7 @@ class WriteStreamsTest(unittest.TestCase):
                 "https://cdn.example/old/index.m3u8\n",
             )
             sidecar = json.loads(
-                (Path(directory) / "权力的游戏" / SIDECAR_NAME).read_text(
+                (Path(directory) / "权力的游戏" / "Season 01" / SIDECAR_NAME).read_text(
                     encoding="utf-8"
                 )
             )
@@ -145,10 +145,11 @@ class _StubEngine:
 class RefreshStreamsTest(unittest.TestCase):
     def _library(self, directory: str) -> tuple[Path, Path]:
         series = Path(directory) / "权力的游戏"
-        episode = series / "Season 01" / "权力的游戏 S01E02.strm"
-        episode.parent.mkdir(parents=True, exist_ok=True)
+        season = series / "Season 01"
+        season.mkdir(parents=True, exist_ok=True)
+        episode = season / "权力的游戏 S01E02.strm"
         episode.write_text("https://cdn.example/old/index.m3u8\n", encoding="utf-8")
-        (series / SIDECAR_NAME).write_text(
+        (season / SIDECAR_NAME).write_text(
             json.dumps({"show_id": "95676", "line": 2, "title": "权力的游戏"}),
             encoding="utf-8",
         )
@@ -220,6 +221,58 @@ class RefreshStreamsTest(unittest.TestCase):
                 movie.read_text(encoding="utf-8"),
                 "https://cdn.example/new/index.m3u8\n",
             )
+
+    def test_each_season_refreshes_against_its_own_source(self) -> None:
+        # Every season of one title shares a title directory, so the sidecar
+        # has to live in the season folder: one sidecar per title would let the
+        # last written season decide what all the others refresh from.
+        def show(show_id: str) -> engine.Series:
+            episodes = [engine.Episode("1", "第1集"), engine.Episode("2", "第2集")]
+            return engine.Series(show_id, "权力的游戏", [engine.Line(2, episodes)])
+
+        def play_info(show_id: str, line: int, episode: str) -> engine.PlayInfo:
+            return engine.PlayInfo(
+                f"https://cdn.example/{show_id}/S{line}E{episode}.m3u8", None
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            for season, show_id in (("01", "95676"), ("07", "101299")):
+                season_dir = Path(directory) / "权力的游戏" / f"Season {season}"
+                season_dir.mkdir(parents=True)
+                (season_dir / f"权力的游戏 S{season}E01.strm").write_text(
+                    "https://cdn.example/old.m3u8\n", encoding="utf-8"
+                )
+                (season_dir / SIDECAR_NAME).write_text(
+                    json.dumps({"show_id": show_id, "line": 2, "title": "权力的游戏"}),
+                    encoding="utf-8",
+                )
+            with (
+                mock.patch.object(engine, "get_show", side_effect=show),
+                mock.patch.object(engine, "get_play_info", side_effect=play_info),
+                mock.patch.object(
+                    engine,
+                    "inspect_playlist_url",
+                    return_value=engine.PlaylistInspection(valid=True, duration=60.0),
+                ),
+            ):
+                statuses = refresh_streams(directory)
+            self.assertEqual([item.status for item in statuses], ["updated", "updated"])
+            urls = sorted(item.url for item in statuses)
+            self.assertEqual(
+                urls,
+                [
+                    "https://cdn.example/101299/S2E1.m3u8",
+                    "https://cdn.example/95676/S2E1.m3u8",
+                ],
+            )
+            for season, show_id in (("01", "95676"), ("07", "101299")):
+                written = (
+                    Path(directory)
+                    / "权力的游戏"
+                    / f"Season {season}"
+                    / f"权力的游戏 S{season}E01.strm"
+                ).read_text(encoding="utf-8")
+                self.assertEqual(written, f"https://cdn.example/{show_id}/S2E1.m3u8\n")
 
 
 if __name__ == "__main__":

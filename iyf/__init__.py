@@ -392,7 +392,11 @@ def write_streams(
         destination = library_path(root, video, video.stream_filename)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(f"{video.stream_url}\n", encoding="utf-8")
-        _write_sidecar(series_directory(root, video), video)
+        # The sidecar sits next to the files it describes: a season folder for
+        # a series, the title folder for a single video. One title can hold
+        # several seasons, so a single sidecar per title would let a later
+        # season overwrite the show and line the other seasons refresh from.
+        _write_sidecar(destination.parent, video)
         paths.append(destination)
     return paths
 
@@ -422,7 +426,7 @@ def _candidate_directories(target: Path) -> list[Path]:
 def _broken(directory: Path, detail: str) -> list[StreamStatus]:
     return [
         StreamStatus(item, "broken", detail)
-        for item in sorted(directory.rglob("*.strm"))
+        for item in sorted(directory.glob("*.strm"))
     ]
 
 
@@ -450,7 +454,7 @@ def refresh_streams(path: str | Path, check_only: bool = False) -> list[StreamSt
             statuses.extend(_broken(directory, f"line {line_number} is gone"))
             continue
         by_number = {int(item.number): item for item in line.episodes}
-        for stream_file in sorted(directory.rglob("*.strm")):
+        for stream_file in sorted(directory.glob("*.strm")):
             match = _EPISODE_RE.search(stream_file.stem)
             episode = int(match.group(1)) if match else min(by_number, default=None)
             if episode is None or episode not in by_number:

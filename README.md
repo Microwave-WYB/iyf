@@ -96,10 +96,14 @@ iyf d "权力的游戏 第一季" -e all --strm -o /mnt/storage/media
 ```
 
 Each `.strm` file holds only the resolved HLS URL, which is what a media server
-reads, and the title directory gets an `.iyf.json` sidecar recording the show
-and line it came from. `iyf refresh <library root or title directory>`
+reads, and the directory holding the files (the season folder for a series)
+gets an `.iyf.json` sidecar recording the show and line it came from. Each
+season keeps its own sidecar, since the seasons of one title share a directory.
+`iyf refresh <library root or title directory>`
 re-resolves those files and rewrites the ones whose URL changed, using the
 sidecar so it never has to search by name again; `--check-only` reports without
+writing and exits non-zero when something is broken or stale, which makes it
+usable from cron.
 writing and exits non-zero when something is broken or stale, which makes it
 usable from cron.
 
