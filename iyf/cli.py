@@ -10,6 +10,7 @@ from . import (
     IyfError,
     _pick_query_source,
     _select_quality_line,
+    _select_quality_line_for,
     _source,
     engine,
     refresh_streams,
@@ -30,6 +31,19 @@ app = typer.Typer(
 console = Console()
 
 
+def _first_selected_episode(selector: str | None) -> int | None:
+    """The first episode a CLI selector asks for: "3-12" -> 3, "all" -> None.
+
+    Only used to keep the rewritten url honest about what will be exported; the
+    selector itself is still parsed and validated by the library.
+    """
+    for chunk in (selector or "").replace("-", ",").split(","):
+        chunk = chunk.strip()
+        if chunk.isdigit():
+            return int(chunk)
+    return None
+
+
 def _download(
     source: str,
     output: Path | None,
@@ -48,7 +62,7 @@ def _download(
             not source.lower().startswith(("http://", "https://"))
             and not source.strip().isdigit()
         ):
-            selection = _pick_query_source(source)
+            selection = _pick_query_source(source, selector=episode)
             if selection is not None:
                 resolved_source = (
                     f"https://www.iyf.lv/iyfplay/"
@@ -72,12 +86,15 @@ def _download(
             parsed = _source(resolved_source)
             if parsed.line is None:
                 series = engine.get_show(parsed.show_id)
-                choice = _select_quality_line(series)
+                choice = _select_quality_line_for(series, parsed.episode, episode)
                 if choice is not None:
                     line, inspection = choice
-                    # Keep an episode that came with the url: writing "1" here
-                    # would silently export a different episode than asked for.
-                    episode_number = parsed.episode if parsed.episode is not None else 1
+                    # Keep an episode that came with the url, or the first one
+                    # the selector asks for: writing "1" would misreport what is
+                    # about to be exported.
+                    episode_number = parsed.episode
+                    if episode_number is None:
+                        episode_number = _first_selected_episode(episode) or 1
                     resolved_source = (
                         f"https://www.iyf.lv/iyfplay/"
                         f"{parsed.show_id}-{line.number}-{episode_number}/"

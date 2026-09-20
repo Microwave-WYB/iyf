@@ -131,8 +131,59 @@ def _select_quality_line(
     return best or fallback
 
 
+def _select_quality_line_for(
+    series: engine.Series,
+    url_episode: int | None,
+    selector: str | None,
+) -> tuple[engine.Line, engine.PlaylistInspection] | None:
+    """Pick a line that can actually serve the requested episodes.
+
+    Selecting on quality alone can land on a line that is missing an episode
+    another line carries — one line of a season offers 23 episodes where
+    another offers 24 — and the export then fails with "episode N not found on
+    this line" even though a playable line has it.
+    """
+    if url_episode is None and not selector:
+        return _select_quality_line(series)
+
+    fallback: tuple[engine.Line, engine.PlaylistInspection] | None = None
+    best: tuple[engine.Line, engine.PlaylistInspection] | None = None
+    for line in sorted(series.lines, key=lambda item: item.number)[
+        :_MAX_QUALITY_LINES_PER_MATCH
+    ]:
+        try:
+            _select_episodes(line.episodes, url_episode, selector)
+        except engine.IyfError:
+            continue
+        inspection = _inspect_line(series.show_id, line)
+        if inspection is None:
+            continue
+        if fallback is None:
+            fallback = (line, inspection)
+        if not inspection.declared:
+            continue
+        if best is None or engine.playlist_quality_key(
+            inspection.quality
+        ) > engine.playlist_quality_key(best[1].quality):
+            best = (line, inspection)
+
+    if best is not None or fallback is not None:
+        return best or fallback
+
+    # Nothing satisfies the request. Let the selector raise against the best
+    # line so the failure names the real reason instead of quietly exporting a
+    # line that cannot serve it.
+    chosen = _select_quality_line(series)
+    if chosen is not None:
+        _select_episodes(chosen[0].episodes, url_episode, selector)
+    return chosen
+
+
 def _pick_query_source(
-    source: str, matches: list[engine.SearchResult] | None = None
+    source: str,
+    matches: list[engine.SearchResult] | None = None,
+    url_episode: int | None = None,
+    selector: str | None = None,
 ) -> _SourceSelection | None:
     matches = query(source) if matches is None else matches
     if not matches:
@@ -147,7 +198,7 @@ def _pick_query_source(
             series = engine.get_show(match.show_id)
         except engine.IyfError:
             continue
-        choice = _select_quality_line(series)
+        choice = _select_quality_line_for(series, url_episode, selector)
         if choice is None:
             continue
         line, inspection = choice

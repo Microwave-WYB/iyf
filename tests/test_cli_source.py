@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 import typer
 
+import iyf
 from iyf import cli, engine
 
 MEDIA = """#EXTM3U
@@ -42,7 +44,9 @@ def _run(
     seen: dict[str, str] = {}
     monkeypatch.setattr(cli, "_source", lambda text: parsed)
     monkeypatch.setattr(engine, "get_show", lambda show_id: series)
-    monkeypatch.setattr(cli, "_select_quality_line", lambda value: choice)
+    monkeypatch.setattr(
+        cli, "_select_quality_line_for", lambda series, url_episode, selector: choice
+    )
     monkeypatch.setattr(
         cli,
         "write_streams",
@@ -124,7 +128,11 @@ def test_a_pinned_line_is_left_alone(monkeypatch, tmp_path) -> None:
     picked: list[object] = []
     seen: dict[str, str] = {}
     monkeypatch.setattr(cli, "_source", lambda text: engine.Source("49676", 1, 1))
-    monkeypatch.setattr(cli, "_select_quality_line", picked.append)
+    monkeypatch.setattr(
+        cli,
+        "_select_quality_line_for",
+        lambda series, url_episode, selector: picked.append(1),
+    )
     monkeypatch.setattr(
         cli,
         "write_streams",
@@ -176,3 +184,72 @@ def test_a_foreign_link_still_fails(monkeypatch, tmp_path) -> None:
             False,
             strm=True,
         )
+
+
+def test_a_title_query_without_a_playable_line_keeps_the_name(
+    monkeypatch, tmp_path
+) -> None:
+    # 剧名路径的结果是 None 时不能编造线路，把名字原样交给上游。
+    seen: dict[str, str] = {}
+    monkeypatch.setattr(cli, "_pick_query_source", lambda source, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "write_streams",
+        lambda src, out, ep: (seen.setdefault("src", src), [tmp_path])[1],
+    )
+
+    cli._download("没有可播线路的剧", tmp_path, None, False, 8, False, strm=True)
+
+    assert seen["src"] == "没有可播线路的剧"
+
+
+def test_a_requested_episode_picks_a_line_that_has_it(monkeypatch, tmp_path) -> None:
+    # 画质最好的线路只有 23 集，而要的是第 24 集：必须改选有第 24 集的那条，
+    # 否则会以 "episode 24 not found on this line" 失败 —— 而这条线路明明有。
+    full = engine.Line(
+        1, [engine.Episode(str(number), f"第{number}集") for number in range(1, 25)]
+    )
+    short = engine.Line(
+        2, [engine.Episode(str(number), f"第{number}集") for number in range(1, 24)]
+    )
+    inspections = {
+        1: SimpleNamespace(valid=True, declared=False, quality=None),
+        2: SimpleNamespace(
+            valid=True,
+            declared=True,
+            quality=SimpleNamespace(
+                width=1920, height=1080, bandwidth=3_000_000, frame_rate=25.0
+            ),
+        ),
+    }
+    monkeypatch.setattr(
+        iyf, "_inspect_line", lambda show_id, line: inspections[line.number]
+    )
+    monkeypatch.setattr(cli, "_source", lambda text: engine.Source("49676"))
+    monkeypatch.setattr(cli.engine, "get_show", lambda show_id: _series(full, short))
+    seen: dict[str, str] = {}
+    monkeypatch.setattr(
+        cli,
+        "write_streams",
+        lambda src, out, ep: (seen.setdefault("src", src), [tmp_path])[1],
+    )
+
+    cli._download("49676", tmp_path, "24", False, 8, False, strm=True)
+
+    assert seen["src"] == "https://www.iyf.lv/iyfplay/49676-1-24/"
+
+
+def test_an_episode_no_line_can_serve_still_fails(monkeypatch, tmp_path) -> None:
+    short = engine.Line(
+        1, [engine.Episode(str(number), f"第{number}集") for number in range(1, 24)]
+    )
+    monkeypatch.setattr(
+        iyf,
+        "_inspect_line",
+        lambda show_id, line: SimpleNamespace(valid=True, declared=False, quality=None),
+    )
+    monkeypatch.setattr(cli, "_source", lambda text: engine.Source("49676"))
+    monkeypatch.setattr(cli.engine, "get_show", lambda show_id: _series(short))
+
+    with pytest.raises(typer.Exit):
+        cli._download("49676", tmp_path, "24", False, 8, False, strm=True)
