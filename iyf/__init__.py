@@ -258,14 +258,11 @@ def resolve_all(link_or_query: str, episode: str | None = None) -> list[Video]:
     show_name = engine.RE_SEASON_TOKEN.sub("", series.title).strip() or series.title
     # A single-video entry (a film or documentary) is named like a movie, not
     # like an episode, so a media server does not file it under season 1.
-    # Counting unique episode numbers keeps several lines that all expose the
-    # same single episode from looking like a series.
-    unique_episodes = {
-        int(episode.number)
-        for show_line in series.lines
-        for episode in show_line.episodes
-    }
-    is_series = len(unique_episodes) > 1
+    # Judge by the line being exported. Counting episode numbers across every
+    # line makes a film look like a series whenever some other line happens to
+    # split it into parts, even when the selected line holds it as one video.
+    # A film offered by several lines that each hold one episode stays a film.
+    is_series = len(line.episodes) > 1
     videos: list[Video] = []
     for selected_episode in _select_episodes(
         line.episodes, normalized.episode, episode

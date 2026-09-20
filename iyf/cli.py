@@ -10,6 +10,7 @@ from . import (
     IyfError,
     _pick_query_source,
     _select_quality_line,
+    _source,
     engine,
     refresh_streams,
     skill_text,
@@ -57,6 +58,27 @@ def _download(
                     f"{selection.line.number}（"
                     f"{engine.playlist_quality_label(selection.inspection)}）"
                 )
+        # A link or a bare show id can leave the line unspecified too, and then
+        # the export silently falls back to DEFAULT_LINE, which may be a line
+        # whose episodes are all gone. Pick a line the same way a title query
+        # does, unless the caller already pinned one in the url.
+        if not json_output and (
+            resolved_source.lower().startswith(("http://", "https://"))
+            or resolved_source.strip().isdigit()
+        ):
+            parsed = _source(resolved_source)
+            if parsed.line is None:
+                series = engine.get_show(parsed.show_id)
+                choice = _select_quality_line(series)
+                if choice is not None:
+                    line, inspection = choice
+                    resolved_source = (
+                        f"https://www.iyf.lv/iyfplay/{parsed.show_id}-{line.number}-1/"
+                    )
+                    selection_message = (
+                        f"已选择：{series.title} 线路 {line.number}（"
+                        f"{engine.playlist_quality_label(inspection)}）"
+                    )
         if not json_output:
             console.print(
                 selection_message or "正在请求 iyf API 并解析视频信息，请稍候…",

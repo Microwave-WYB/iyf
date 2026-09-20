@@ -390,6 +390,21 @@ class SeriesDetectionTest(unittest.TestCase):
         self.assertTrue(video.is_series)
         self.assertEqual(video.filename, "权力的游戏 S01E01.mp4")
 
+    def test_a_line_that_splits_a_movie_does_not_make_it_a_series(self) -> None:
+        # 有线路把电影拆成「第1集/第2集」，但被选中的线路（2）是单片。
+        # 判断必须看被导出的那条线路，不能看所有线路的并集 —— 否则整部电影
+        # 会被写成 <片名>/Season 01/<片名> S01E01.strm，媒体库认不出来。
+        split = [engine.Episode("1", "第1集"), engine.Episode("2", "第2集")]
+        single = [engine.Episode("1", "正片")]
+        series = engine.Series(
+            "76801",
+            "蜘蛛侠：英雄远征",
+            [engine.Line(1, split), engine.Line(2, single)],
+        )
+        video = self._resolve(series)[0]
+        self.assertFalse(video.is_series)
+        self.assertEqual(video.filename, "蜘蛛侠：英雄远征.mp4")
+
 
 if __name__ == "__main__":
     unittest.main()
