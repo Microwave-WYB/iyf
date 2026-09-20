@@ -331,6 +331,7 @@ class ProgressSample:
 
 
 _SIZE_PROBE_WORKERS = 32
+_MAX_PROBE_PLAYLIST_BYTES = 2_000_000
 
 
 def _playlist_segments(text: str, base_url: str) -> tuple[list[str], list[float]]:
@@ -390,10 +391,15 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
     881 with 32 workers, and matched the downloaded payload to within a
     kilobyte.
 
-    ``deadline`` bounds the whole call, playlist reads included. Whatever
-    answered in time is scaled by the media time it covers, which makes the
-    result an estimate rather than a measurement; ``None`` means no usable
-    answer at all, and callers then show bytes without a denominator.
+    ``deadline`` bounds every network phase: playlist reads use the remaining
+    time, an expired deadline skips them, and HEAD requests are submitted in
+    windows that stop at the deadline. Local parsing is the one phase it
+    cannot interrupt, so a playlist larger than ``_MAX_PROBE_PLAYLIST_BYTES``
+    is refused outright. Whatever answered in time is scaled by the media time
+    it covers, which makes the result an estimate rather than a measurement;
+    ``None`` means no usable answer at all, and callers then show bytes
+    without a denominator.
+
     In-flight HEAD requests are abandoned rather than awaited, so they can
     outlive the call by their own per-request timeout.
     """
@@ -425,6 +431,11 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
     if "#EXT-X-ENDLIST" not in text:
         # A live or event playlist keeps growing, so its current segment list
         # is not this download's total.
+        return None
+    if len(text) > _MAX_PROBE_PLAYLIST_BYTES:
+        # Parsing cannot be interrupted by the deadline, so bound it by
+        # refusing absurd playlists instead: real episodes list 128-881
+        # segments (about 100 KB of text), and this allows roughly 13k.
         return None
     urls, durations = _playlist_segments(text, media_url)
     if not urls or any(duration <= 0 for duration in durations):

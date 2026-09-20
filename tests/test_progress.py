@@ -303,6 +303,20 @@ class ProbeTotalBytesTest(unittest.TestCase):
             )
         fetch.assert_not_called()
 
+    def test_absurd_playlists_are_refused_without_network(self) -> None:
+        # Parsing is the one phase the deadline cannot interrupt, so the size
+        # bound has to reject it before any request is made.
+        text = media_playlist([(f"seg{i}.ts", 5.0) for i in range(120_000)])
+        self.assertGreater(len(text), engine._MAX_PROBE_PLAYLIST_BYTES)
+        with (
+            mock.patch.object(engine, "_http_get", return_value=text),
+            mock.patch.object(engine.httpx, "head") as head,
+        ):
+            self.assertIsNone(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8")
+            )
+        head.assert_not_called()
+
 
 class DownloadOptionsTest(unittest.TestCase):
     """
