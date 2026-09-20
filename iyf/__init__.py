@@ -9,7 +9,7 @@ import httpx
 from . import engine, normalize
 from .progress import ProgressRenderer
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 _ALLOWED_HOSTS = {"iyf.tv", "www.iyf.tv", "iyf.lv", "www.iyf.lv"}
 
 
