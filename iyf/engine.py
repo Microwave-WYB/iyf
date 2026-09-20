@@ -421,7 +421,7 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
             text = _http_get(url, timeout=left)
         except IyfError:
             return None
-        if len(text) > _MAX_PROBE_PLAYLIST_BYTES:
+        if len(text.encode("utf-8")) > _MAX_PROBE_PLAYLIST_BYTES:
             return None
         return text
 
