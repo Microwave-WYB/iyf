@@ -317,6 +317,26 @@ class ProbeTotalBytesTest(unittest.TestCase):
             )
         head.assert_not_called()
 
+    def test_absurd_master_playlists_are_refused_before_parsing(self) -> None:
+        # The size bound lives in fetch(), so an oversized master is refused
+        # before _best_variant() walks it.
+        variants = "".join(
+            f"#EXT-X-STREAM-INF:BANDWIDTH={index}\nv{index}.m3u8\n"
+            for index in range(150_000)
+        )
+        text = f"#EXTM3U\n{variants}#EXT-X-ENDLIST\n"
+        self.assertGreater(len(text), engine._MAX_PROBE_PLAYLIST_BYTES)
+        with (
+            mock.patch.object(engine, "_http_get", return_value=text),
+            mock.patch.object(engine, "_best_variant") as best,
+            mock.patch.object(engine.httpx, "head") as head,
+        ):
+            self.assertIsNone(
+                engine.probe_total_bytes("https://cdn.example/master.m3u8")
+            )
+        best.assert_not_called()
+        head.assert_not_called()
+
 
 class DownloadOptionsTest(unittest.TestCase):
     """

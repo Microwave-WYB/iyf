@@ -409,13 +409,21 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
         return max(deadline - (time.monotonic() - started), 0.0)
 
     def fetch(url: str) -> str | None:
+        """Read one playlist, bounded by the deadline and by its own size.
+
+        Parsing is local work the deadline cannot interrupt, so an oversized
+        playlist is refused here, before any master or media playlist parsing.
+        """
         left = remaining()
         if left <= 0:
             return None
         try:
-            return _http_get(url, timeout=left)
+            text = _http_get(url, timeout=left)
         except IyfError:
             return None
+        if len(text) > _MAX_PROBE_PLAYLIST_BYTES:
+            return None
+        return text
 
     text = fetch(media_url)
     if text is None:
@@ -431,11 +439,6 @@ def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
     if "#EXT-X-ENDLIST" not in text:
         # A live or event playlist keeps growing, so its current segment list
         # is not this download's total.
-        return None
-    if len(text) > _MAX_PROBE_PLAYLIST_BYTES:
-        # Parsing cannot be interrupted by the deadline, so bound it by
-        # refusing absurd playlists instead: real episodes list 128-881
-        # segments (about 100 KB of text), and this allows roughly 13k.
         return None
     urls, durations = _playlist_segments(text, media_url)
     if not urls or any(duration <= 0 for duration in durations):
