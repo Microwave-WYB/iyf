@@ -88,6 +88,12 @@ def _render(videos: list[Video], events: queue.Queue[ProgressEvent | None]) -> N
                 if current_visible:
                     progress.update(current_id, visible=False)
                     current_visible = False
+                # Rich's ``update`` and ``reset`` treat ``total=None`` as
+                # "keep the current total", so clear it directly: the next
+                # episode may have no measured total and must not inherit
+                # this denominator or this episode's speed samples.
+                progress.reset(current_id, start=False)
+                progress.tasks[current_id].total = None
                 progress.update(overall_id, advance=1)
                 continue
             sample = event.sample
@@ -99,8 +105,21 @@ def _render(videos: list[Video], events: queue.Queue[ProgressEvent | None]) -> N
                 progress.update(
                     current_id, description=video.episode_title, visible=True
                 )
+                progress.start_task(current_id)
                 current_visible = True
-            progress.update(current_id, completed=float(sample.downloaded))
+            task = progress.tasks[current_id]
+            total = float(task.total) if task.total else None
+            completed = float(sample.downloaded)
+            if total is not None:
+                completed = min(completed, total)
+            # Both yt-dlp hooks and the .part watcher report, so samples can
+            # arrive out of order and the bar must not move backwards — but a
+            # denominator that only arrives late can still be smaller than the
+            # bytes already reported, and then it wins.
+            previous = float(task.completed)
+            if total is not None:
+                previous = min(previous, total)
+            progress.update(current_id, completed=max(previous, completed))
 
 
 class ProgressRenderer:

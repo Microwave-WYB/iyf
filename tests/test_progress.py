@@ -26,13 +26,33 @@ def media_playlist(
     return "\n".join(lines) + "\n"
 
 
+class FakeResponse:
+    """Minimal ``httpx`` response stand-in for HEAD probes."""
+
+    def __init__(
+        self, content_length: int | None = None, status_code: int = 200
+    ) -> None:
+        self.status_code = status_code
+        self.headers = (
+            {} if content_length is None else {"content-length": str(content_length)}
+        )
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise engine.httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=engine.httpx.Request("HEAD", "https://cdn.example/segment.ts"),
+                response=engine.httpx.Response(self.status_code),
+            )
+
+
 def fake_head(sizes: dict[str, int]):
     """Return a stand-in for ``httpx.head`` that answers with ``Content-Length``."""
 
     def head(url: str, **_kwargs: object) -> object:
         if url not in sizes:
             raise engine.httpx.HTTPError(f"no size for {url}")
-        return mock.Mock(headers={"content-length": str(sizes[url])})
+        return FakeResponse(sizes[url])
 
     return head
 
@@ -194,6 +214,123 @@ class ProbeTotalBytesTest(unittest.TestCase):
                 engine.probe_total_bytes("https://cdn.example/index.m3u8")
             )
 
+    def test_error_statuses_are_not_counted(self) -> None:
+        text = media_playlist([("a.ts", 5.0), ("b.ts", 5.0), ("c.ts", 5.0)])
+        sizes = {
+            "https://cdn.example/a.ts": 1_000_000,
+            "https://cdn.example/b.ts": 1_000_000,
+            "https://cdn.example/c.ts": 3_000_000,
+        }
+
+        def head(url: str, **_kwargs: object) -> object:
+            # A 404 still carries a Content-Length; it must not count as data.
+            return FakeResponse(sizes[url], status_code=404 if "b.ts" in url else 200)
+
+        with (
+            mock.patch.object(engine, "_http_get", return_value=text),
+            mock.patch.object(engine.httpx, "head", side_effect=head),
+        ):
+            total = engine.probe_total_bytes("https://cdn.example/index.m3u8")
+        # 4 MB measured over 10 s of media, scaled to the full 15 s.
+        self.assertEqual(total, 6_000_000)
+
+    def test_single_segment_playlist_is_usable(self) -> None:
+        text = media_playlist([("a.ts", 5.0)])
+        sizes = {"https://cdn.example/a.ts": 1_234}
+        with (
+            mock.patch.object(engine, "_http_get", return_value=text),
+            mock.patch.object(engine.httpx, "head", side_effect=fake_head(sizes)),
+        ):
+            self.assertEqual(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8"), 1_234
+            )
+
+    def test_infinite_duration_does_not_raise(self) -> None:
+        text = (
+            "#EXTM3U\n"
+            "#EXTINF:1e309,\na.ts\n"
+            "#EXTINF:10.0,\nb.ts\n"
+            "#EXTINF:10.0,\nc.ts\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        sizes = {
+            "https://cdn.example/a.ts": 1_000,
+            "https://cdn.example/b.ts": 1_000,
+            "https://cdn.example/c.ts": 1_000,
+        }
+        with (
+            mock.patch.object(engine, "_http_get", return_value=text),
+            mock.patch.object(engine.httpx, "head", side_effect=fake_head(sizes)),
+        ):
+            # The infinite duration is dropped, so 2 MB over 20 s scale to 20 s.
+            self.assertEqual(
+                engine.probe_total_bytes("https://cdn.example/index.m3u8"), 2_000
+            )
+
+
+class DownloadOptionsTest(unittest.TestCase):
+    """
+    The options handed to yt-dlp must silence its own progress bar, and the
+    size probe must not run when nothing reports progress.
+    """
+
+    URL = "https://cdn.example/index.m3u8"
+    OUT = "/tmp/iyf-options-test/out.mp4"
+
+    def _run(
+        self,
+        *,
+        progress_cb: object = None,
+        show_progress: bool = False,
+        verbose: bool = False,
+    ) -> dict[str, object]:
+        captured: dict[str, object] = {}
+
+        class FakeYDL:
+            def __init__(self, options: dict[str, object]) -> None:
+                captured.update(options)
+
+            def __enter__(self) -> "FakeYDL":
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
+            def download(self, _urls: list[str]) -> int:
+                return 0
+
+        with mock.patch.object(engine.yt_dlp, "YoutubeDL", FakeYDL):
+            engine.download(
+                self.URL,
+                self.OUT,
+                verbose=verbose,
+                show_progress=show_progress,
+                progress_cb=progress_cb,  # type: ignore[arg-type]
+            )
+        return captured
+
+    def test_noprogress_silences_yt_dlp_unless_verbose(self) -> None:
+        with mock.patch.object(engine, "probe_total_bytes", return_value=1_000):
+            self.assertIs(
+                self._run(progress_cb=lambda _sample: None)["noprogress"], True
+            )
+            self.assertIs(
+                self._run(progress_cb=lambda _sample: None, verbose=True)["noprogress"],
+                False,
+            )
+
+    def test_probe_is_skipped_when_nothing_reports_progress(self) -> None:
+        with mock.patch.object(engine, "probe_total_bytes") as probe:
+            self._run()
+        probe.assert_not_called()
+
+    def test_probe_runs_when_a_callback_reports_progress(self) -> None:
+        with mock.patch.object(
+            engine, "probe_total_bytes", return_value=4_242
+        ) as probe:
+            self._run(progress_cb=lambda _sample: None)
+        probe.assert_called_once_with(self.URL)
+
 
 class WatchPartFileTest(unittest.TestCase):
     def test_reports_a_growing_part_file(self) -> None:
@@ -240,54 +377,140 @@ class WatchPartFileTest(unittest.TestCase):
 
 class RendererTest(unittest.TestCase):
     @staticmethod
-    def video() -> Video:
+    def video(episode: str = "1", title: str = "第1集") -> Video:
         return Video(
             link="https://www.iyf.lv/iyftv/1/",
             show_id="1",
             line=1,
             show_name="示例剧",
             season=1,
-            episode="1",
-            episode_title="第1集",
+            episode=episode,
+            episode_title=title,
             media_class="视频",
             stream_url="https://cdn.example/index.m3u8",
         )
 
-    def test_renderer_accepts_total_only_and_completion_events(self) -> None:
-        renderer = ProgressRenderer([self.video()])
-        callback = renderer.callback(0)
-        callback(engine.ProgressSample(downloaded=1_000, total=None))
-        callback(engine.ProgressSample(total=3_000))  # probe result, no bytes yet
-        callback(engine.ProgressSample(downloaded=3_000, total=3_000, finished=True))
-        renderer.finish(0)
-        renderer.close()
-
-    def test_episode_task_is_marked_as_a_byte_task(self) -> None:
-        # Regression guard: Rich's add_task takes ``**fields``, so passing
-        # ``fields={...}`` leaves task.fields["bytes"] unset and the byte and
-        # speed columns render as empty strings.
-        seen: dict[str, dict[str, object]] = {}
+    @staticmethod
+    def _run(
+        videos: list[Video],
+        events: list[tuple[int, engine.ProgressSample | None]],
+    ) -> dict[str, object]:
+        """Render ``events`` and return the Rich tasks, keyed by description."""
+        tasks: dict[str, object] = {}
         original = progress.Progress
 
         class Spy(original):  # type: ignore[misc, valid-type]
             def add_task(self, description: str, **kwargs: object) -> object:
                 task_id = super().add_task(description, **kwargs)  # type: ignore[arg-type]
-                seen[description] = self.tasks[task_id].fields  # type: ignore[index]
+                tasks[description] = self.tasks[task_id]  # type: ignore[index]
                 return task_id
 
         with mock.patch.object(progress, "Progress", Spy):
-            renderer = ProgressRenderer([self.video()])
-            renderer.callback(0)(engine.ProgressSample(downloaded=1, total=2))
-            renderer.finish(0)
+            renderer = ProgressRenderer(videos)
+            for index, sample in events:
+                if sample is None:
+                    renderer.finish(index)
+                else:
+                    renderer.callback(index)(sample)
             renderer.close()
-        self.assertEqual(seen["第1集"], {"bytes": True})
-        self.assertNotIn("bytes", seen["总进度"])
+        return tasks
+
+    def test_renderer_accepts_total_only_and_completion_events(self) -> None:
+        # No finish event: a completed episode resets its task (see below).
+        tasks = self._run(
+            [self.video()],
+            [
+                (0, engine.ProgressSample(downloaded=1_000, total=None)),
+                (0, engine.ProgressSample(total=3_000)),
+                (
+                    0,
+                    engine.ProgressSample(downloaded=3_000, total=3_000, finished=True),
+                ),
+            ],
+        )
+        self.assertEqual(tasks["第1集"].total, 3_000)
+        self.assertEqual(tasks["第1集"].completed, 3_000)
+
+    def test_episode_task_is_marked_as_a_byte_task(self) -> None:
+        # Regression guard: Rich's add_task takes ``**fields``, so passing
+        # ``fields={...}`` leaves task.fields["bytes"] unset and the byte and
+        # speed columns render as empty strings.
+        tasks = self._run(
+            [self.video()],
+            [(0, engine.ProgressSample(downloaded=1, total=2))],
+        )
+        self.assertEqual(tasks["第1集"].fields, {"bytes": True})
+        self.assertNotIn("bytes", tasks["总进度"].fields)
 
     def test_renderer_without_total_never_crashes(self) -> None:
-        renderer = ProgressRenderer([self.video()])
-        renderer.callback(0)(engine.ProgressSample(downloaded=512))
-        renderer.finish(0)
-        renderer.close()
+        tasks = self._run([self.video()], [(0, engine.ProgressSample(downloaded=512))])
+        self.assertIsNone(tasks["第1集"].total)
+        self.assertEqual(tasks["第1集"].completed, 512)
+
+    def test_finishing_an_episode_clears_its_task(self) -> None:
+        # The task is reused for the next episode, so a finished episode must
+        # not leave its denominator or byte count behind.
+        tasks = self._run(
+            [self.video()],
+            [
+                (0, engine.ProgressSample(downloaded=100, total=100)),
+                (0, None),
+            ],
+        )
+        self.assertIsNone(tasks["第1集"].total)
+        self.assertEqual(tasks["第1集"].completed, 0)
+        self.assertEqual(tasks["总进度"].completed, 1)
+
+    def test_second_episode_does_not_inherit_the_previous_total(self) -> None:
+        # The episode bar is a single reused task, so the second episode is
+        # the same task object with a new description.
+        tasks = self._run(
+            [self.video("1", "第1集"), self.video("2", "第2集")],
+            [
+                (0, engine.ProgressSample(downloaded=100, total=100)),
+                (0, None),
+                (1, engine.ProgressSample(downloaded=10, total=None)),
+            ],
+        )
+        episode = tasks["第1集"]
+        self.assertEqual(episode.description, "第2集")
+        self.assertIsNone(episode.total)
+        self.assertEqual(episode.completed, 10)
+        self.assertEqual(tasks["总进度"].completed, 1)
+
+    def test_bar_never_moves_backwards(self) -> None:
+        # yt-dlp hooks and the .part watcher both report, so samples can
+        # arrive out of order.
+        tasks = self._run(
+            [self.video()],
+            [
+                (0, engine.ProgressSample(downloaded=100, total=None)),
+                (0, engine.ProgressSample(downloaded=50, total=None)),
+            ],
+        )
+        self.assertEqual(tasks["第1集"].completed, 100)
+
+    def test_bar_is_clamped_to_a_late_total(self) -> None:
+        tasks = self._run(
+            [self.video()],
+            [
+                (0, engine.ProgressSample(downloaded=100, total=None)),
+                (0, engine.ProgressSample(downloaded=100, total=80)),
+            ],
+        )
+        self.assertEqual(tasks["第1集"].completed, 80)
+
+    def test_overall_bar_advances_once_per_episode(self) -> None:
+        tasks = self._run(
+            [self.video("1", "第1集"), self.video("2", "第2集")],
+            [
+                (0, engine.ProgressSample(downloaded=100, total=100, finished=True)),
+                (0, None),
+                (1, engine.ProgressSample(downloaded=100, total=100, finished=True)),
+                (1, None),
+            ],
+        )
+        self.assertEqual(tasks["总进度"].completed, 2)
 
 
 if __name__ == "__main__":

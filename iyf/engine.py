@@ -2,6 +2,7 @@
 
 import html
 import json
+import math
 import re
 import threading
 import time
@@ -98,6 +99,7 @@ class DownloadParams(TypedDict, total=False):
     noplaylist: bool
     no_warnings: bool
     quiet: bool
+    noprogress: bool
     hls_prefer_native: bool
     concurrent_fragment_downloads: int
     progress_hooks: list[Callable[[dict[str, object]], None]]
@@ -327,8 +329,7 @@ class ProgressSample:
     finished: bool = False
 
 
-_SIZE_PROBE_WORKERS = 16
-_MAX_PROBE_SEGMENTS = 400
+_SIZE_PROBE_WORKERS = 32
 
 
 def _playlist_segments(text: str, base_url: str) -> tuple[list[str], list[float]]:
@@ -344,6 +345,11 @@ def _playlist_segments(text: str, base_url: str) -> tuple[list[str], list[float]
             try:
                 pending = float(line[len("#EXTINF:") :].split(",")[0])
             except ValueError:
+                pending = 0.0
+            if not math.isfinite(pending) or pending < 0:
+                # A malformed or infinite duration must not reach the
+                # arithmetic below: that raises instead of returning None
+                # like every other unusable input.
                 pending = 0.0
         elif not line.startswith("#"):
             urls.append(urllib.parse.urljoin(base_url, line))
@@ -370,31 +376,46 @@ def _best_variant(media_url: str, text: str) -> str | None:
     return best_url
 
 
-def probe_total_bytes(media_url: str, deadline: float = 4.0) -> int | None:
+def probe_total_bytes(media_url: str, deadline: float = 6.0) -> int | None:
     """Measure the payload size of an HLS VOD stream in bytes.
 
     yt-dlp has no size for HLS up front, and its ``total_bytes_estimate`` is
     extrapolated from finished fragments: on a measured 310.6 MB episode it
     started at 789 MB and only converged at the very end. Sampling segment
-    sizes is not good enough either, because segment sizes here run from
-    100 KB to 11 MB over 0.8-20 s of media, so an 8-to-64 segment sample
-    landed 2.5-17% off. Asking every segment for its ``Content-Length``
-    downloaded payload to within a kilobyte. Returns ``None`` instead of
-    raising whenever the playlist or the headers are unusable, and otherwise
-    answers from whatever arrived within ``deadline`` seconds (scaled by
-    media time), so a slow CDN cannot stall the download it measures.
+    sizes instead is not good enough either, because segment sizes here run
+    from 100 KB to 11 MB over 0.8-20 s of media: an 8-to-64 segment sample
+    landed 2.5-17% off, and even a 294-of-881 sample was 2% off. Asking every
+    segment for its ``Content-Length`` cost 2 s for 128 segments and 3.3 s for
+    881 with 32 workers, and matched the downloaded payload to within a
+    kilobyte.
+
+    ``deadline`` bounds the whole call, playlist reads included. Whatever
+    answered in time is scaled by the media time it covers, which makes the
+    result an estimate rather than a measurement; ``None`` means no usable
+    answer at all, and callers then show bytes without a denominator.
+    In-flight HEAD requests are abandoned rather than awaited, so they can
+    outlive the call by their own per-request timeout.
     """
-    try:
-        text = _http_get(media_url)
-    except IyfError:
+    started = time.monotonic()
+
+    def remaining() -> float:
+        return max(deadline - (time.monotonic() - started), 0.0)
+
+    def fetch(url: str) -> str | None:
+        try:
+            return _http_get(url, timeout=max(remaining(), 1.0))
+        except IyfError:
+            return None
+
+    text = fetch(media_url)
+    if text is None:
         return None
     if "#EXT-X-STREAM-INF" in text:
         variant = _best_variant(media_url, text)
         if variant is None:
             return None
-        try:
-            text = _http_get(variant)
-        except IyfError:
+        text = fetch(variant)
+        if text is None:
             return None
         media_url = variant
     if "#EXT-X-ENDLIST" not in text:
@@ -403,25 +424,20 @@ def probe_total_bytes(media_url: str, deadline: float = 4.0) -> int | None:
         return None
     urls, durations = _playlist_segments(text, media_url)
     total_duration = sum(durations)
-    if len(urls) < 2 or total_duration <= 0:
+    if not urls or total_duration <= 0:
         return None
-
-    if len(urls) > _MAX_PROBE_SEGMENTS:
-        # Very long playlists: sample evenly and scale by media time instead
-        # of issuing thousands of requests for one progress bar.
-        step = len(urls) // _MAX_PROBE_SEGMENTS + 1
-        picks = list(range(0, len(urls), step))
-    else:
-        picks = list(range(len(urls)))
 
     def measure(index: int) -> tuple[int, float]:
         try:
             response = httpx.head(
                 urls[index],
                 headers={"User-Agent": USER_AGENT, "Referer": REFERER},
-                timeout=5.0,
+                timeout=3.0,
                 follow_redirects=True,
             )
+            # A 404 or 403 can still carry a Content-Length; only a real
+            # segment answer may contribute bytes.
+            response.raise_for_status()
             return max(int(response.headers.get("content-length", 0)), 0), durations[
                 index
             ]
@@ -430,8 +446,8 @@ def probe_total_bytes(media_url: str, deadline: float = 4.0) -> int | None:
 
     pool = ThreadPoolExecutor(max_workers=_SIZE_PROBE_WORKERS)
     try:
-        futures = [pool.submit(measure, index) for index in picks]
-        done, pending = wait(futures, timeout=deadline)
+        futures = [pool.submit(measure, index) for index in range(len(urls))]
+        done, pending = wait(futures, timeout=remaining())
         for future in pending:
             future.cancel()
         measured = [future.result() for future in done if future.exception() is None]
@@ -440,12 +456,12 @@ def probe_total_bytes(media_url: str, deadline: float = 4.0) -> int | None:
     usable = [
         (size, duration) for size, duration in measured if size > 0 and duration > 0
     ]
-    if len(usable) < 2:
+    if len(usable) < min(2, len(urls)):
         return None
-    covered = sum(duration for _, duration in usable)
     measured_bytes = sum(size for size, _ in usable)
-    if len(picks) == len(urls) and len(usable) == len(urls):
+    if len(usable) == len(urls):
         return measured_bytes
+    covered = sum(duration for _, duration in usable)
     return int(measured_bytes / covered * total_duration)
 
 
